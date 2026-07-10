@@ -1,0 +1,26 @@
+manifestVersion: 1
+name: "@shrug/freeipa/domain"
+version: "2026.07.10.1"
+description: "Read-only FreeIPA domain inspection over the JSON-RPC API: realm/config, server inventory, and replication topology, plus a markdown + Mermaid summary report."
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - domain.ts
+
+reports:
+  - freeipa_domain_summary.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - identity
+  - inventory
+  - topology
