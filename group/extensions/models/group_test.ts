@@ -1,18 +1,26 @@
 /**
- * Unit tests for the pure helpers of the `@shrug/freeipa/group` model.
+ * Unit tests for the `@shrug/freeipa/group` model.
  *
- * These cover the value-shaping logic (IPA's single-element array unwrapping and
- * member merging), the `radius-vlan-<id>` name builder, the DuplicateEntry
- * predicate that makes group creation idempotent, and the JSON-RPC body builder.
- * The network seam (`ipaLogin`) is intentionally not exercised here; it is
- * covered by the live smoke test.
+ * Two layers:
+ *  - The pure value-shaping helpers (IPA array unwrapping + member merging), the
+ *    `radius-vlan-<id>` name builder, the DuplicateEntry idempotency predicate,
+ *    and the JSON-RPC body builder.
+ *  - The method execute paths (groupFind/ensureVlanGroup/groupAdd|RemoveMember)
+ *    driven through a mocked transport. The model's one network seam is
+ *    `ipaLogin()` over the global `fetch`; {@link installFetch} stubs `fetch` to
+ *    return IPA JSON-RPC envelopes so the methods run hermetically. The
+ *    interesting branches are ensureVlanGroup's happy path, its DuplicateEntry
+ *    swallow (re-run idempotency), and its partial-failure path — group_add
+ *    lands but hostgroup_add fails non-duplicate, which must persist
+ *    `complete:false` state and rethrow.
  *
  * @module
  */
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   buildRpcBody,
   isDuplicateEntry,
+  model,
   one,
   parseGroupRow,
   parseGroupRows,
@@ -118,4 +126,256 @@ Deno.test("isDuplicateEntry() detects DuplicateEntry / code 4002", () => {
   );
   assertEquals(isDuplicateEntry({ name: "SomethingElse", code: 4001 }), false);
   assertEquals(isDuplicateEntry(undefined), false);
+});
+
+// ---------------------------------------------------------------------------
+// Mocked-transport harness — drives the method execute paths without a network.
+// ---------------------------------------------------------------------------
+
+/** An IPA JSON-RPC response envelope, success or failure. */
+type Envelope = {
+  error: { name?: string; message?: string; code?: number } | null;
+  result: Record<string, unknown> | null;
+};
+
+/** Build a success envelope wrapping the given `result` payload. */
+function ok(result: Record<string, unknown>): Envelope {
+  return { error: null, result };
+}
+
+/** Build a failure envelope carrying an IPA-style error. */
+function err(name: string, message: string, code = 4001): Envelope {
+  return { error: { name, message, code }, result: null };
+}
+
+/** A recorded `writeResource` call. */
+interface WriteCall {
+  spec: string;
+  name: string;
+  data: Record<string, unknown>;
+}
+
+/** Installed `fetch` mock: dispatches by IPA command, records JSON calls. */
+interface FetchMock {
+  restore: () => void;
+  /** Each `/session/json` request, in order, by IPA command (no `/1`). */
+  jsonCalls: Array<{ command: string; params: unknown }>;
+}
+
+/**
+ * Replace the global `fetch` with an in-memory IPA server.
+ *
+ * The `login_password` step returns a Set-Cookie `ipa_session`; each
+ * `/session/json` request is dispatched to `handlers` keyed by IPA command
+ * (e.g. `group_add`). A handler value is an {@link Envelope} (or a thunk
+ * returning one); an unmapped command is a test bug and throws.
+ */
+function installFetch(
+  handlers: Record<string, Envelope | (() => Envelope)>,
+): FetchMock {
+  const original = globalThis.fetch;
+  const jsonCalls: FetchMock["jsonCalls"] = [];
+
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/session/login_password")) {
+      const headers = new Headers();
+      headers.append("set-cookie", "ipa_session=SESSION; Path=/ipa; HttpOnly");
+      return Promise.resolve(new Response("", { status: 200, headers }));
+    }
+    if (url.endsWith("/session/json")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        method: string;
+        params: unknown;
+      };
+      const command = body.method.replace(/\/1$/, "");
+      jsonCalls.push({ command, params: body.params });
+      const handler = handlers[command];
+      if (handler === undefined) {
+        throw new Error(`unexpected IPA command in test: ${command}`);
+      }
+      const env = typeof handler === "function" ? handler() : handler;
+      return Promise.resolve(
+        new Response(JSON.stringify(env), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    throw new Error(`unexpected fetch URL in test: ${url}`);
+  }) as typeof fetch;
+
+  return {
+    restore: () => {
+      globalThis.fetch = original;
+    },
+    jsonCalls,
+  };
+}
+
+/** Stub ExecuteContext: no-op logger, recording writeResource, test globals. */
+function stubContext() {
+  const writes: WriteCall[] = [];
+  const noop = (_m: string, _p?: Record<string, unknown>) => {};
+  const context = {
+    globalArgs: {
+      server: "ipa1.example.com",
+      user: "admin",
+      password: "secret",
+      apiVersion: "2.254",
+    },
+    logger: { debug: noop, info: noop, warning: noop, error: noop },
+    writeResource: (
+      spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      writes.push({ spec, name, data });
+      return Promise.resolve({ name });
+    },
+    // deno-lint-ignore no-explicit-any
+  } as any;
+  return { context, writes };
+}
+
+Deno.test("groupFind: snapshots user + host groups into `groups`", async () => {
+  const mock = installFetch({
+    group_find: ok({ result: [{ cn: ["admins"] }], count: 1 }),
+    hostgroup_find: ok({ result: [{ cn: ["webservers"] }], count: 1 }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupFind.execute({}, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_find",
+      "hostgroup_find",
+    ]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "groups");
+    assertEquals((writes[0].data.userGroups as unknown[]).length, 1);
+    assertEquals((writes[0].data.hostGroups as unknown[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureVlanGroup: both adds succeed -> attempt + complete state", async () => {
+  const mock = installFetch({
+    group_add: ok({ result: { cn: ["radius-vlan-20"] } }),
+    hostgroup_add: ok({ result: { cn: ["radius-vlan-20"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureVlanGroup.execute({ vlanId: 20 }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_add",
+      "hostgroup_add",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "vlanGroup"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(writes[1].data.complete, true);
+    assertEquals(writes[1].data.userGroupPresent, true);
+    assertEquals(writes[1].data.hostGroupPresent, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureVlanGroup: DuplicateEntry is swallowed -> idempotent success", async () => {
+  // A re-run: the user group already exists (group_add -> DuplicateEntry), the
+  // host group is created fresh. The whole ensure still succeeds and completes.
+  const mock = installFetch({
+    group_add: err(
+      "DuplicateEntry",
+      'group with name "radius-vlan-20" already exists',
+      4002,
+    ),
+    hostgroup_add: ok({ result: { cn: ["radius-vlan-20"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureVlanGroup.execute({ vlanId: 20 }, context);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "vlanGroup"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(writes[1].data.complete, true);
+    assertEquals(writes[1].data.userGroupPresent, true);
+    assertEquals(writes[1].data.hostGroupPresent, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureVlanGroup: partial failure persists complete:false then rethrows", async () => {
+  // group_add lands, but hostgroup_add fails with a non-duplicate error. The
+  // real partial state must be persisted (complete:false, only the user half
+  // present) and the step must fail.
+  const mock = installFetch({
+    group_add: ok({ result: { cn: ["radius-vlan-20"] } }),
+    hostgroup_add: err("DatabaseError", "constraint violation", 4203),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () => model.methods.ensureVlanGroup.execute({ vlanId: 20 }, context),
+      Error,
+      "hostgroup_add failed",
+    );
+    // Failure audit first, then the partial state.
+    assertEquals(writes.map((w) => w.spec), ["attempt", "vlanGroup"]);
+    assertEquals(writes[0].data.success, false);
+    assertEquals(writes[0].data.response, null);
+    assertEquals(writes[1].data.complete, false);
+    assertEquals(writes[1].data.userGroupPresent, true);
+    assertEquals(writes[1].data.hostGroupPresent, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupAddMember: audits the add and surfaces IPA's failed structure", async () => {
+  const mock = installFetch({
+    group_add_member: ok({
+      completed: 1,
+      failed: { member: { user: [], group: [] } },
+      result: { cn: ["radius-vlan-20"], member_user: ["alice"] },
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupAddMember.execute(
+      { cn: "radius-vlan-20", kind: "user", users: ["alice"] },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["group_add_member"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    const response = writes[0].data.response as { completed: unknown };
+    assertEquals(response.completed, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupRemoveMember: host kind maps to hostgroup_remove_member", async () => {
+  const mock = installFetch({
+    hostgroup_remove_member: ok({
+      completed: 1,
+      failed: { member: { host: [] } },
+      result: { cn: ["radius-vlan-20"] },
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupRemoveMember.execute(
+      { cn: "radius-vlan-20", kind: "host", hosts: ["host1.example.com"] },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "hostgroup_remove_member",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
 });
