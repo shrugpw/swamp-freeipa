@@ -2,9 +2,10 @@
 
 A swamp model for **managing [FreeIPA](https://www.freeipa.org/) user accounts**
 over its JSON-RPC API. It logs in with a session password, snapshots users
-(`find`/`show`) as versioned resources, and mutates them (`add`/`mod`/`del`/
-`setEnabled`) — recording an honest audit trail for every write and guarding the
-destructive delete behind an explicit confirmation.
+(`find`/`show`) as versioned resources, mutates them (`add`/`mod`/`del`/
+`setEnabled`), and reconciles them to a desired spec (`sync`) — recording an
+honest audit trail for every write and guarding the destructive delete behind an
+explicit confirmation.
 
 It is the user surface of the `@shrug/freeipa/*` family; the read-only
 domain-inspection surface lives in `@shrug/freeipa/domain`.
@@ -45,30 +46,58 @@ swamp model method run my-ipa-users show --arg uid=jdoe
 swamp model method run my-ipa-users add \
   --arg uid=jdoe --arg givenName=John --arg sn=Doe --arg 'mail=["jdoe@example.com"]'
 
+# Create idempotently: an existing user is a no-op success, not a failure
+swamp model method run my-ipa-users add \
+  --arg uid=jdoe --arg givenName=John --arg sn=Doe --arg idempotent=true
+
 # Modify a user -> updated "user" + "attempt"
 swamp model method run my-ipa-users mod --arg uid=jdoe --arg 'set={"title":"Staff"}'
+
+# Reconcile a user to a desired spec (create-or-update; converged == no writes)
+swamp model method run my-ipa-users sync \
+  --arg uid=jdoe --arg givenName=John --arg sn=Doe \
+  --arg 'mail=["jdoe@example.com"]' --arg enabled=true
 
 # Enable / disable a user -> updated "user" + "attempt"
 swamp model method run my-ipa-users setEnabled --arg uid=jdoe --arg enabled=false
 
 # Delete a user (confirm:true REQUIRED) -> "attempt"
 swamp model method run my-ipa-users del --arg uid=jdoe --arg confirm=true
+
+# Delete idempotently: an already-absent user is a no-op success
+swamp model method run my-ipa-users del --arg uid=jdoe --arg confirm=true --arg idempotent=true
 ```
 
 ## Methods
 
-| Method       | IPA command(s)                | Reads/Writes | State resource       | Audit |
-| ------------ | ----------------------------- | ------------ | -------------------- | ----- |
-| `find`       | `user_find [criteria\|""]`    | read         | `users`              | —     |
-| `show`       | `user_show [uid]`             | read         | `user`               | —     |
-| `add`        | `user_add [uid]`              | write        | `user` (on success)  | ✓     |
-| `mod`        | `user_mod [uid]`              | write        | `user` (on success)  | ✓     |
-| `del`        | `user_del [uid]`              | write        | — (nothing to store) | ✓     |
-| `setEnabled` | `user_enable`/`user_disable`  | write        | `user` (on success)  | ✓     |
+| Method       | IPA command(s)                       | Reads/Writes | State resource       | Audit |
+| ------------ | ------------------------------------ | ------------ | -------------------- | ----- |
+| `find`       | `user_find [criteria\|""]`           | read         | `users`              | —     |
+| `show`       | `user_show [uid]`                    | read         | `user`               | —     |
+| `add`        | `user_add [uid]`                     | write        | `user` (on success)  | ✓     |
+| `mod`        | `user_mod [uid]`                     | write        | `user` (on success)  | ✓     |
+| `del`        | `user_del [uid]`                     | write        | — (nothing to store) | ✓     |
+| `setEnabled` | `user_enable`/`user_disable`         | write        | `user` (on success)  | ✓     |
+| `sync`       | `user_show` + `user_add`/`user_mod`/`user_enable`/`user_disable` | write | `user` (converged) | ✓ |
 
 Parsed user rows expose `uid`, `givenName`, `sn`, `cn`, `mail[]`, `disabled`
 (from `nsaccountlock`), and `memberOfGroups[]`, plus a `raw` passthrough of the
 complete IPA entry so nothing is lost.
+
+### Idempotency & reconcile
+
+`add` and `del` take an optional `idempotent: boolean` (default `false`). When
+true, `add` treats an existing user (IPA `DuplicateEntry`) as a no-op success —
+re-reading the live entry — and `del` treats an already-absent user (IPA
+`NotFound`) as success. The default preserves fail-on-conflict; `del`'s `confirm`
+guard always applies regardless.
+
+`sync` reconciles a user to a desired spec: it creates the user when absent,
+otherwise `user_mod`s **only** the attributes that have drifted (`givenName`,
+`sn`, `cn`, `mail`, and any extra `options`) and enables/disables to match the
+optional `enabled`. It is idempotent — a fully-converged user issues no IPA
+writes, and the `attempt` audit records the exact `changes` made. Group
+membership is out of scope; use `@shrug/freeipa/group`.
 
 ## Write-safety model
 

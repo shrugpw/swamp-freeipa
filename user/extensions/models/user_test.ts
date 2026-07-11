@@ -16,7 +16,10 @@
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
+  attrEquals,
   buildRpcBody,
+  isDuplicateEntry,
+  isNotFound,
   model,
   one,
   parseUser,
@@ -96,6 +99,43 @@ Deno.test("parseUser() defaults absent optionals sensibly", () => {
     memberOfGroups: [],
     raw: entry,
   });
+});
+
+Deno.test("isDuplicateEntry() matches by name, code, or message", () => {
+  assertEquals(isDuplicateEntry({ name: "DuplicateEntry", code: 4002 }), true);
+  assertEquals(isDuplicateEntry({ code: 4002 }), true);
+  assertEquals(
+    isDuplicateEntry(new Error("IPA user_add failed: DuplicateEntry: x")),
+    true,
+  );
+  assertEquals(isDuplicateEntry("… (code 4002)"), true);
+  assertEquals(isDuplicateEntry({ name: "NotFound", code: 4001 }), false);
+  assertEquals(isDuplicateEntry(new Error("boom")), false);
+});
+
+Deno.test("isNotFound() matches by name, code, or message", () => {
+  assertEquals(isNotFound({ name: "NotFound", code: 4001 }), true);
+  assertEquals(isNotFound({ code: 4001 }), true);
+  assertEquals(
+    isNotFound(new Error("IPA user_del failed: NotFound: x (code 4001)")),
+    true,
+  );
+  assertEquals(isNotFound("… (code 4001)"), true);
+  assertEquals(isNotFound({ name: "DuplicateEntry", code: 4002 }), false);
+  assertEquals(isNotFound(new Error("boom")), false);
+});
+
+Deno.test("attrEquals() compares desired vs raw IPA values set-wise", () => {
+  // Scalar desired vs single-element IPA array.
+  assertEquals(attrEquals(["John"], "John"), true);
+  // Order-insensitive multi-value.
+  assertEquals(attrEquals(["a@x", "b@x"], ["b@x", "a@x"]), true);
+  // Absent actual vs a desired value differs.
+  assertEquals(attrEquals(undefined, ["a@x"]), false);
+  // Absent both sides converge.
+  assertEquals(attrEquals(undefined, []), true);
+  // Genuine drift.
+  assertEquals(attrEquals(["Doe"], "Roe"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -387,6 +427,230 @@ Deno.test("setEnabled: audits the toggle then re-reads user state", async () => 
     assertEquals(writes.map((w) => w.spec), ["attempt", "user"]);
     assertEquals(writes[0].data.method, "user_disable");
     assertEquals((writes[1].data.user as { disabled: boolean }).disabled, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("add idempotent: DuplicateEntry re-reads and records success", async () => {
+  // user_add reports the entry exists; the idempotent path re-reads via
+  // user_show and records the attempt as a success no-op.
+  const mock = installFetch({
+    user_add: err("DuplicateEntry", "user jdoe already exists", 4002),
+    user_show: ok({ result: jdoeEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.add.execute(
+      { uid: "jdoe", givenName: "John", sn: "Doe", idempotent: true },
+      context,
+    );
+    // The duplicate is caught inside the attempt, so user_show follows user_add.
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "user_add",
+      "user_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "user"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.request as { idempotent: boolean }).idempotent,
+      true,
+    );
+    assertEquals((writes[1].data.user as { uid: string }).uid, "jdoe");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("add non-idempotent: DuplicateEntry still fails (default preserved)", async () => {
+  const mock = installFetch({
+    user_add: err("DuplicateEntry", "user jdoe already exists", 4002),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.add.execute(
+          { uid: "jdoe", givenName: "John", sn: "Doe" },
+          context,
+        ),
+      Error,
+      "user_add failed",
+    );
+    // No idempotent re-read; audit-only, failure.
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["user_add"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("del idempotent: NotFound records success, no state", async () => {
+  const mock = installFetch({
+    user_del: err("NotFound", "user gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.del.execute(
+      { uid: "gone", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["user_del"]);
+    // No live user to snapshot: audit-only, but a success no-op.
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("del non-idempotent: NotFound still fails (default preserved)", async () => {
+  const mock = installFetch({
+    user_del: err("NotFound", "user gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.del.execute(
+          { uid: "gone", confirm: true },
+          context,
+        ),
+      Error,
+      "user_del failed",
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("del idempotent still honors the confirm guard", async () => {
+  const mock = installFetch({});
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.del.execute(
+          { uid: "jdoe", confirm: false, idempotent: true },
+          context,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+    assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("sync: absent user is created, then snapshotted", async () => {
+  let shows = 0;
+  const mock = installFetch({
+    // First user_show (the reconcile read) 404s -> create; the final
+    // snapshot user_show succeeds.
+    user_show: () =>
+      shows++ === 0
+        ? err("NotFound", "user jdoe not found", 4001)
+        : ok({ result: jdoeEntry }),
+    user_add: ok({ result: jdoeEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.sync.execute(
+      { uid: "jdoe", givenName: "John", sn: "Doe" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "user_show",
+      "user_add",
+      "user_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "user"]);
+    assertEquals(writes[0].data.success, true);
+    const resp = writes[0].data.response as {
+      created: boolean;
+      changes: string[];
+      converged: boolean;
+    };
+    assertEquals(resp.created, true);
+    assertEquals(resp.changes, ["created"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("sync: a converged user issues no IPA writes", async () => {
+  // Actual matches desired exactly (givenName/sn, no mail, enabled) so the
+  // diff is empty and no user_mod/enable/disable is issued.
+  const mock = installFetch({ user_show: ok({ result: jdoeEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.sync.execute(
+      { uid: "jdoe", givenName: "John", sn: "Doe" },
+      context,
+    );
+    // Only the initial reconcile read and the final snapshot read — no writes.
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "user_show",
+      "user_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "user"]);
+    const resp = writes[0].data.response as {
+      converged: boolean;
+      changes: string[];
+    };
+    assertEquals(resp.converged, true);
+    assertEquals(resp.changes, []);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("sync: drift is reconciled with user_mod + user_disable", async () => {
+  let shows = 0;
+  const disabled = { ...jdoeEntry, nsaccountlock: [true], mail: ["j@x"] };
+  const mock = installFetch({
+    // Initial read: enabled, no mail (drifted from desired); final read shows
+    // the reconciled entry.
+    user_show: () =>
+      shows++ === 0 ? ok({ result: jdoeEntry }) : ok({ result: disabled }),
+    user_mod: ok({ result: { ...jdoeEntry, mail: ["j@x"] } }),
+    user_disable: ok({ result: true, value: "jdoe", summary: "Disabled" }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.sync.execute(
+      {
+        uid: "jdoe",
+        givenName: "John",
+        sn: "Doe",
+        mail: ["j@x"],
+        enabled: false,
+      },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "user_show",
+      "user_mod",
+      "user_disable",
+      "user_show",
+    ]);
+    // user_mod set only the drifted `mail` attribute, not givenName/sn.
+    const modCall = mock.jsonCalls.find((c) => c.command === "user_mod");
+    assertEquals(
+      (modCall!.params as [string[], Record<string, unknown>])[1].mail,
+      ["j@x"],
+    );
+    const resp = writes[0].data.response as { changes: string[] };
+    assertEquals(resp.changes, ["mod:mail", "disabled"]);
   } finally {
     mock.restore();
   }

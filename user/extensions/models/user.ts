@@ -466,6 +466,76 @@ export type User = z.infer<typeof UserSchema>;
 /** A multi-user snapshot resource. */
 export type Users = z.infer<typeof UsersSchema>;
 
+/**
+ * Predicate: is this error IPA's "entry already exists" (`DuplicateEntry`,
+ * code 4002)? Used to make `add` idempotent — a duplicate means the user is
+ * already present, which is success for an idempotent create.
+ *
+ * Accepts the raw IPA error object, an `Error` whose message was formatted by
+ * {@link ipaLogin} (`... DuplicateEntry: ... (code 4002)`), or a bare string.
+ * Copied verbatim from the family's `group` package (extensions publish
+ * independently and cannot cross-import); keep the two in sync.
+ *
+ * @param e The caught error (any shape).
+ * @returns `true` when it represents a duplicate-entry condition.
+ */
+export function isDuplicateEntry(e: unknown): boolean {
+  const matches = (s: string) =>
+    /DuplicateEntry/i.test(s) || /\bcode 4002\b/.test(s);
+  if (e && typeof e === "object") {
+    const obj = e as { name?: unknown; code?: unknown; message?: unknown };
+    if (obj.name === "DuplicateEntry") return true;
+    if (obj.code === 4002) return true;
+    if (typeof obj.message === "string" && matches(obj.message)) return true;
+    return false;
+  }
+  if (typeof e === "string") return matches(e);
+  return false;
+}
+
+/**
+ * Predicate: is this error IPA's "no such entry" (`NotFound`, code 4001)? The
+ * mirror of {@link isDuplicateEntry} — used to make `del` idempotent, where a
+ * missing target means it is already gone, which is success for an idempotent
+ * delete.
+ *
+ * Accepts the raw IPA error object, an `Error` whose message was formatted by
+ * {@link ipaLogin} (`... NotFound: ... (code 4001)`), or a bare string.
+ *
+ * @param e The caught error (any shape).
+ * @returns `true` when it represents a not-found condition.
+ */
+export function isNotFound(e: unknown): boolean {
+  const matches = (s: string) => /NotFound/i.test(s) || /\bcode 4001\b/.test(s);
+  if (e && typeof e === "object") {
+    const obj = e as { name?: unknown; code?: unknown; message?: unknown };
+    if (obj.name === "NotFound") return true;
+    if (obj.code === 4001) return true;
+    if (typeof obj.message === "string" && matches(obj.message)) return true;
+    return false;
+  }
+  if (typeof e === "string") return matches(e);
+  return false;
+}
+
+/**
+ * Compare a desired attribute value against a raw IPA attribute value for the
+ * `sync` reconcile diff. IPA stores attributes as (often single-element)
+ * arrays; a desired value may be a scalar or an array. Both sides are
+ * normalized to sorted string arrays and compared set-wise, so multi-valued
+ * attributes (e.g. `mail`) are order-insensitive and `"John"` equals
+ * `["John"]`.
+ *
+ * @param actualRaw The raw IPA value (from a parsed user's `raw` entry).
+ * @param desired The desired value (scalar or array).
+ * @returns `true` when the two represent the same attribute set.
+ */
+export function attrEquals(actualRaw: unknown, desired: unknown): boolean {
+  const a = toStrArray(actualRaw).slice().sort();
+  const d = toStrArray(desired).slice().sort();
+  return a.length === d.length && a.every((x, i) => x === d[i]);
+}
+
 /** Minimal check context this model's pre-flight checks rely on. */
 interface CheckContext {
   globalArgs: GlobalArgs;
@@ -484,9 +554,9 @@ interface CheckContext {
 /** FreeIPA user management model definition. */
 export const model = {
   type: "@shrug/freeipa/user",
-  version: "2026.07.11.1",
+  version: "2026.07.11.2",
   description:
-    "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes, each with an audit trail and a confirm-guarded delete.",
+    "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes and a desired-state sync reconcile, each with an audit trail and a confirm-guarded delete. add/del take an optional idempotent flag.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "users": {
@@ -630,6 +700,13 @@ export const model = {
           .array(z.string())
           .optional()
           .describe("Email address(es) (IPA `mail`)"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-existing user (IPA DuplicateEntry) is treated as success: the live entry is re-read and recorded as a no-op instead of failing. Default false preserves fail-on-duplicate.",
+          ),
         options: z
           .record(z.string(), z.unknown())
           .optional()
@@ -644,12 +721,14 @@ export const model = {
           sn: string;
           cn?: string;
           mail?: string[];
+          idempotent?: boolean;
           options?: Record<string, unknown>;
         },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
         const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
         const options: Record<string, unknown> = {
           givenname: args.givenName,
           sn: args.sn,
@@ -662,15 +741,36 @@ export const model = {
           context,
           args.uid,
           "user_add",
-          ["user_add"],
+          idempotent ? ["user_add", "user_show"] : ["user_add"],
           {
             uid: args.uid,
             givenName: args.givenName,
             sn: args.sn,
             cn: args.cn ?? null,
             mail: args.mail ?? null,
+            idempotent,
           },
-          () => client.call("user_add", [args.uid], options),
+          async () => {
+            try {
+              return await client.call("user_add", [args.uid], options);
+            } catch (e) {
+              // Idempotent create: an existing user is a no-op success. Re-read
+              // the live entry so the recorded response and the `user` state
+              // reflect reality (user_add would have returned the fresh entry;
+              // user_show gives the pre-existing one). Non-duplicate errors and
+              // the default (idempotent:false) path still propagate.
+              if (idempotent && isDuplicateEntry(e)) {
+                context.logger.info(
+                  "user_add: {uid} already exists, treating as no-op (idempotent)",
+                  { uid: args.uid },
+                );
+                return await client.call("user_show", [args.uid], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
         );
 
         const user = parseUser(
@@ -736,9 +836,21 @@ export const model = {
           .describe(
             "Preserve the entry (soft-delete) instead of removing it (IPA `preserve`)",
           ),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent user (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
       }),
       execute: async (
-        args: { uid: string; confirm: boolean; preserve?: boolean },
+        args: {
+          uid: string;
+          confirm: boolean;
+          preserve?: boolean;
+          idempotent?: boolean;
+        },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         if (args.confirm !== true) {
@@ -748,6 +860,7 @@ export const model = {
         }
         const cfg = context.globalArgs;
         const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
         const options: Record<string, unknown> = args.preserve !== undefined
           ? { preserve: args.preserve }
           : {};
@@ -757,8 +870,24 @@ export const model = {
           args.uid,
           "user_del",
           ["user_del"],
-          { uid: args.uid, preserve: args.preserve ?? false },
-          () => client.call("user_del", [args.uid], options),
+          { uid: args.uid, preserve: args.preserve ?? false, idempotent },
+          async () => {
+            try {
+              return await client.call("user_del", [args.uid], options);
+            } catch (e) {
+              // Idempotent delete: an already-gone user is a no-op success.
+              // Non-NotFound errors and the default (idempotent:false) path
+              // still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "user_del: {uid} already absent, treating as no-op (idempotent)",
+                  { uid: args.uid },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
         );
         return { dataHandles: [handle] };
       },
@@ -797,6 +926,148 @@ export const model = {
         });
         const user = parseUser(
           (showRes.result ?? {}) as Record<string, unknown>,
+        );
+        const userHandle = await context.writeResource("user", "user", {
+          server: cfg.server,
+          user,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, userHandle] };
+      },
+    },
+    sync: {
+      description:
+        "Reconcile a user to a desired spec: create it if absent (user_add), otherwise user_mod only the drifted attributes (givenName/sn/cn/mail + extra options) and user_enable/user_disable to match. Idempotent — a converged user issues no IPA writes. Group membership is out of scope (see @shrug/freeipa/group). Writes the converged user state on success; audits both paths, and the audit response lists the `changes` made.",
+      arguments: z.object({
+        uid: z.string().describe("User login (uid) to reconcile"),
+        givenName: z.string().describe("Desired first name (IPA `givenname`)"),
+        sn: z.string().describe("Desired surname (IPA `sn`)"),
+        cn: z
+          .string()
+          .optional()
+          .describe(
+            "Desired full name (IPA `cn`); omit to leave cn unmanaged (IPA derives it on create)",
+          ),
+        mail: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Desired email address(es) (IPA `mail`); omit to leave mail unmanaged",
+          ),
+        enabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Desired account lock state; true -> enabled, false -> disabled. Omit to leave the lock state unmanaged.",
+          ),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra desired IPA attributes to reconcile (lowercase IPA option names), diffed and user_mod'd like the built-in fields",
+          ),
+      }),
+      execute: async (
+        args: {
+          uid: string;
+          givenName: string;
+          sn: string;
+          cn?: string;
+          mail?: string[];
+          enabled?: boolean;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        context.logger.info("Reconciling user {uid}", { uid: args.uid });
+
+        // 1. Read actual state (the user may not exist yet).
+        let actual: UserRow | null = null;
+        try {
+          const showRes = await client.call("user_show", [args.uid], {
+            all: true,
+          });
+          actual = parseUser(
+            (showRes.result ?? {}) as Record<string, unknown>,
+          );
+        } catch (e) {
+          if (!isNotFound(e)) throw e;
+          context.logger.info("user {uid} absent — will create", {
+            uid: args.uid,
+          });
+        }
+
+        // The desired managed attribute set, in IPA option form.
+        const desiredAttrs: Record<string, unknown> = {
+          givenname: args.givenName,
+          sn: args.sn,
+          ...(args.cn !== undefined ? { cn: args.cn } : {}),
+          ...(args.mail !== undefined ? { mail: args.mail } : {}),
+          ...(args.options ?? {}),
+        };
+
+        const changes: string[] = [];
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.uid,
+          "sync",
+          ["user_show", "user_add", "user_mod", "user_enable", "user_disable"],
+          {
+            uid: args.uid,
+            desired: desiredAttrs,
+            enabled: args.enabled ?? null,
+          },
+          async () => {
+            if (actual === null) {
+              // 2a. Absent -> create with the full desired spec.
+              await client.call("user_add", [args.uid], desiredAttrs);
+              changes.push("created");
+            } else {
+              // 2b. Present -> user_mod only the attributes that drifted.
+              const set: Record<string, unknown> = {};
+              for (const [k, v] of Object.entries(desiredAttrs)) {
+                if (!attrEquals(actual.raw[k], v)) set[k] = v;
+              }
+              if (Object.keys(set).length > 0) {
+                await client.call("user_mod", [args.uid], set);
+                changes.push(...Object.keys(set).map((k) => `mod:${k}`));
+              }
+            }
+
+            // 3. Reconcile the lock state (a fresh user_add is enabled).
+            if (args.enabled !== undefined) {
+              const currentlyEnabled = actual === null
+                ? true
+                : !actual.disabled;
+              if (args.enabled !== currentlyEnabled) {
+                const cmd = args.enabled ? "user_enable" : "user_disable";
+                await client.call(cmd, [args.uid], {});
+                changes.push(args.enabled ? "enabled" : "disabled");
+              }
+            }
+
+            return {
+              uid: args.uid,
+              created: actual === null,
+              changes,
+              converged: changes.length === 0,
+            };
+          },
+        );
+
+        // State resource, success-only: re-read so the snapshot is the
+        // converged user regardless of which branch ran.
+        context.logger.info("user {uid} reconciled: {changes}", {
+          uid: args.uid,
+          changes: (result as { changes: string[] }).changes,
+        });
+        const finalRes = await client.call("user_show", [args.uid], {
+          all: true,
+        });
+        const user = parseUser(
+          (finalRes.result ?? {}) as Record<string, unknown>,
         );
         const userHandle = await context.writeResource("user", "user", {
           server: cfg.server,

@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@shrug/freeipa/user"
-version: "2026.07.11.1"
-description: "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes, each with an audit trail and a confirm-guarded delete."
+version: "2026.07.11.2"
+description: "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes and a desired-state sync reconcile, each with an audit trail and a confirm-guarded delete. add/del take an optional idempotent flag."
 
 repository: https://github.com/shrugpw/swamp-freeipa
 
