@@ -281,9 +281,23 @@ const AttemptSchema = z.object({
 /** One mutation attempt-record (see {@link AttemptSchema}). */
 export type Attempt = z.infer<typeof AttemptSchema>;
 
+/**
+ * The structural slice of swamp's LogTape logger the write-kernel and methods
+ * use. Declared locally (not imported) so the kernel stays self-contained and
+ * byte-identical across the family. Messages use `{name}` placeholders filled
+ * from the properties object — never string interpolation, and never secrets.
+ */
+interface MethodLogger {
+  debug(message: string, properties?: Record<string, unknown>): void;
+  info(message: string, properties?: Record<string, unknown>): void;
+  warning(message: string, properties?: Record<string, unknown>): void;
+  error(message: string, properties?: Record<string, unknown>): void;
+}
+
 /** Minimal execute context the write-kernel relies on. */
 interface ExecuteContext {
   globalArgs: GlobalArgs;
+  logger: MethodLogger;
   writeResource: (
     specName: string,
     name: string,
@@ -338,6 +352,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
     attemptedAt: new Date().toISOString(),
   };
   const instance = `attempt-${method}-${target}`;
+  context.logger.info(
+    "{method}: applying to {target} on {server}",
+    { method, target, server: base.server, ipaCommands },
+  );
   try {
     const result = await fn();
     const handle = await context.writeResource("attempt", instance, {
@@ -346,6 +364,7 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: result,
       error: null,
     });
+    context.logger.info("{method}: succeeded on {target}", { method, target });
     return { result, handle };
   } catch (e) {
     await context.writeResource("attempt", instance, {
@@ -354,6 +373,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: null,
       error: e instanceof Error ? e.message : String(e),
     });
+    context.logger.error(
+      "{method}: failed on {target}: {error}",
+      { method, target, error: e instanceof Error ? e.message : String(e) },
+    );
     throw e;
   }
 }
@@ -461,7 +484,7 @@ interface CheckContext {
 /** FreeIPA user management model definition. */
 export const model = {
   type: "@shrug/freeipa/user",
-  version: "2026.07.10.1",
+  version: "2026.07.11.1",
   description:
     "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes, each with an audit trail and a confirm-guarded delete.",
   globalArguments: GlobalArgsSchema,
@@ -547,12 +570,16 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Finding users matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
         const client = await ipaLogin(cfg);
         const res = await client.call("user_find", [args.criteria ?? ""], {
           all: true,
         });
         const users = ((res.result ?? []) as Array<Record<string, unknown>>)
           .map(parseUser);
+        context.logger.info("Found {count} users", { count: users.length });
 
         const handle = await context.writeResource("users", "users", {
           server: cfg.server,
@@ -572,9 +599,11 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Showing user {uid}", { uid: args.uid });
         const client = await ipaLogin(cfg);
         const res = await client.call("user_show", [args.uid], { all: true });
         const user = parseUser((res.result ?? {}) as Record<string, unknown>);
+        context.logger.info("Retrieved user {uid}", { uid: args.uid });
 
         const handle = await context.writeResource("user", "user", {
           server: cfg.server,

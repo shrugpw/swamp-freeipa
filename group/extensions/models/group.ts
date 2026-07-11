@@ -346,9 +346,23 @@ const AttemptSchema = z.object({
 /** One mutation attempt-record (see {@link AttemptSchema}). */
 export type Attempt = z.infer<typeof AttemptSchema>;
 
+/**
+ * The structural slice of swamp's LogTape logger the write-kernel and methods
+ * use. Declared locally (not imported) so the kernel stays self-contained and
+ * byte-identical across the family. Messages use `{name}` placeholders filled
+ * from the properties object — never string interpolation, and never secrets.
+ */
+interface MethodLogger {
+  debug(message: string, properties?: Record<string, unknown>): void;
+  info(message: string, properties?: Record<string, unknown>): void;
+  warning(message: string, properties?: Record<string, unknown>): void;
+  error(message: string, properties?: Record<string, unknown>): void;
+}
+
 /** Minimal execute context the write-kernel relies on. */
 interface ExecuteContext {
   globalArgs: GlobalArgs;
+  logger: MethodLogger;
   writeResource: (
     specName: string,
     name: string,
@@ -403,6 +417,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
     attemptedAt: new Date().toISOString(),
   };
   const instance = `attempt-${method}-${target}`;
+  context.logger.info(
+    "{method}: applying to {target} on {server}",
+    { method, target, server: base.server, ipaCommands },
+  );
   try {
     const result = await fn();
     const handle = await context.writeResource("attempt", instance, {
@@ -411,6 +429,7 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: result,
       error: null,
     });
+    context.logger.info("{method}: succeeded on {target}", { method, target });
     return { result, handle };
   } catch (e) {
     await context.writeResource("attempt", instance, {
@@ -419,6 +438,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: null,
       error: e instanceof Error ? e.message : String(e),
     });
+    context.logger.error(
+      "{method}: failed on {target}: {error}",
+      { method, target, error: e instanceof Error ? e.message : String(e) },
+    );
     throw e;
   }
 }
@@ -507,7 +530,7 @@ export function isDuplicateEntry(e: unknown): boolean {
 /** FreeIPA group management model definition. */
 export const model = {
   type: "@shrug/freeipa/group",
-  version: "2026.07.10.1",
+  version: "2026.07.11.1",
   description:
     "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable.",
   globalArguments: GlobalArgsSchema,
@@ -548,6 +571,9 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Finding groups matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
         const client = await ipaLogin(cfg);
         const crit = args.criteria ?? "";
         const userRes = await client.call("group_find", [crit], { all: true });
@@ -559,6 +585,10 @@ export const model = {
         );
         const hostGroups = parseGroupRows(
           (hostRes.result ?? []) as Array<Record<string, unknown>>,
+        );
+        context.logger.info(
+          "Found {userCount} user groups and {hostCount} host groups",
+          { userCount: userGroups.length, hostCount: hostGroups.length },
         );
 
         const handle = await context.writeResource("groups", "groups", {

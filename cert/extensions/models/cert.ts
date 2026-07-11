@@ -297,9 +297,23 @@ const AttemptSchema = z.object({
 /** One mutation attempt-record (see {@link AttemptSchema}). */
 export type Attempt = z.infer<typeof AttemptSchema>;
 
+/**
+ * The structural slice of swamp's LogTape logger the write-kernel and methods
+ * use. Declared locally (not imported) so the kernel stays self-contained and
+ * byte-identical across the family. Messages use `{name}` placeholders filled
+ * from the properties object — never string interpolation, and never secrets.
+ */
+interface MethodLogger {
+  debug(message: string, properties?: Record<string, unknown>): void;
+  info(message: string, properties?: Record<string, unknown>): void;
+  warning(message: string, properties?: Record<string, unknown>): void;
+  error(message: string, properties?: Record<string, unknown>): void;
+}
+
 /** Minimal execute context the write-kernel relies on. */
 interface ExecuteContext {
   globalArgs: GlobalArgs;
+  logger: MethodLogger;
   writeResource: (
     specName: string,
     name: string,
@@ -354,6 +368,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
     attemptedAt: new Date().toISOString(),
   };
   const instance = `attempt-${method}-${target}`;
+  context.logger.info(
+    "{method}: applying to {target} on {server}",
+    { method, target, server: base.server, ipaCommands },
+  );
   try {
     const result = await fn();
     const handle = await context.writeResource("attempt", instance, {
@@ -362,6 +380,7 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: result,
       error: null,
     });
+    context.logger.info("{method}: succeeded on {target}", { method, target });
     return { result, handle };
   } catch (e) {
     await context.writeResource("attempt", instance, {
@@ -370,6 +389,10 @@ async function recordAttempt<T extends Record<string, unknown>>(
       response: null,
       error: e instanceof Error ? e.message : String(e),
     });
+    context.logger.error(
+      "{method}: failed on {target}: {error}",
+      { method, target, error: e instanceof Error ? e.message : String(e) },
+    );
     throw e;
   }
 }
@@ -583,7 +606,7 @@ export async function generateCsr(opts: {
 /** FreeIPA certificate model definition. */
 export const model = {
   type: "@shrug/freeipa/cert",
-  version: "2026.07.10.1",
+  version: "2026.07.11.1",
   description:
     "Issue, inspect, and revoke X.509 certs for any FreeIPA principal (user/host/service) over the JSON-RPC API. Optional in-model RSA keygen with vaulted private keys.",
   globalArguments: GlobalArgsSchema,
@@ -630,6 +653,13 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info(
+          "Searching certificates (subject={subject}, criteria={criteria})",
+          {
+            subject: args.subject ?? "(any)",
+            criteria: args.criteria ?? "(none)",
+          },
+        );
         const client = await ipaLogin(cfg);
         const options: Record<string, unknown> = { all: true, sizelimit: 0 };
         if (args.subject) options.subject = args.subject;
@@ -639,6 +669,9 @@ export const model = {
           options,
         );
         const rows = (res.result ?? []) as Array<Record<string, unknown>>;
+        context.logger.info("Found {count} certificates", {
+          count: rows.length,
+        });
         const handle = await context.writeResource("certs", "certs", {
           server: cfg.server,
           subject: args.subject,
@@ -662,12 +695,18 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Showing certificate {serial}", {
+          serial: String(args.serial),
+        });
         const client = await ipaLogin(cfg);
         const res = await client.call("cert_show", [args.serial], {
           all: true,
         });
         const raw = (res.result ?? {}) as Record<string, unknown>;
         const row = parseCertRow(raw);
+        context.logger.info("Retrieved certificate {serial}", {
+          serial: row.serialNumber,
+        });
         const certVal = one(raw.certificate);
         const handle = await context.writeResource(
           "cert",
@@ -749,6 +788,14 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info(
+          "Issuing certificate for {principal} (algorithm={algorithm}, csrProvided={csrProvided})",
+          {
+            principal: args.principal,
+            algorithm: args.algorithm,
+            csrProvided: Boolean(args.csr),
+          },
+        );
 
         // Resolve the CSR: bring-your-own (PEM or path) vs. in-model keygen.
         let csrPem: string;

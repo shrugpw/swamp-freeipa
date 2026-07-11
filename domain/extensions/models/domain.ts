@@ -517,9 +517,23 @@ export async function readLatest<T>(
   return JSON.parse(new TextDecoder().decode(bytes)) as T;
 }
 
+/**
+ * The structural slice of swamp's LogTape logger the methods use. Declared
+ * locally (not imported) so the model stays self-contained. Messages use
+ * `{name}` placeholders filled from the properties object — never string
+ * interpolation, and never secrets.
+ */
+interface MethodLogger {
+  debug(message: string, properties?: Record<string, unknown>): void;
+  info(message: string, properties?: Record<string, unknown>): void;
+  warning(message: string, properties?: Record<string, unknown>): void;
+  error(message: string, properties?: Record<string, unknown>): void;
+}
+
 /** Minimal shape of the execute context this model relies on. */
 interface ExecuteContext {
   globalArgs: GlobalArgs;
+  logger: MethodLogger;
   writeResource: (
     specName: string,
     name: string,
@@ -535,7 +549,7 @@ interface ExecuteResult {
 /** FreeIPA domain inspection model definition. */
 export const model = {
   type: "@shrug/freeipa/domain",
-  version: "2026.07.10.1",
+  version: "2026.07.11.1",
   description:
     "Read-only FreeIPA domain inspection over the JSON-RPC API: env/config, server & role inventory, replication topology.",
   globalArguments: GlobalArgsSchema,
@@ -569,6 +583,9 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Snapshotting domain env/config from {server}", {
+          server: cfg.server,
+        });
         const client = await ipaLogin(cfg);
         const envRes = await client.call("env", [], {});
         const configRes = await client.call("config_show", [], { all: true });
@@ -576,6 +593,9 @@ export const model = {
 
         const env = (envRes.result ?? {}) as Record<string, unknown>;
         const config = (configRes.result ?? {}) as Record<string, unknown>;
+        context.logger.info("Captured domain config (realm={realm})", {
+          realm: String(one(env.realm) ?? "unknown"),
+        });
 
         const handle = await context.writeResource("config", "config", {
           server: cfg.server,
@@ -600,11 +620,17 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info("Snapshotting server inventory from {server}", {
+          server: cfg.server,
+        });
         const client = await ipaLogin(cfg);
         const serverRes = await client.call("server_find", [""], { all: true });
         const servers = parseServers(
           (serverRes.result ?? []) as Array<Record<string, unknown>>,
         );
+        context.logger.info("Captured {count} servers", {
+          count: servers.length,
+        });
 
         const handle = await context.writeResource("servers", "servers", {
           server: cfg.server,
@@ -623,6 +649,10 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
+        context.logger.info(
+          "Snapshotting replication topology from {server}",
+          { server: cfg.server },
+        );
         const client = await ipaLogin(cfg);
         const suffixRes = await client.call("topologysuffix_find", [""], {
           all: true,
@@ -651,6 +681,11 @@ export const model = {
             ),
           );
         }
+
+        context.logger.info(
+          "Captured {suffixCount} suffixes and {segmentCount} segments",
+          { suffixCount: suffixes.length, segmentCount: segments.length },
+        );
 
         const handle = await context.writeResource("topology", "topology", {
           server: cfg.server,

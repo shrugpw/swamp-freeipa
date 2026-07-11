@@ -23,7 +23,7 @@ import {
 } from "./domain.ts";
 
 Deno.test("one() unwraps single-element arrays", () => {
-  assertEquals(one(["freeipa2.ipa.shrug.pw"]), "freeipa2.ipa.shrug.pw");
+  assertEquals(one(["ipa2.example.com"]), "ipa2.example.com");
   assertEquals(one("scalar"), "scalar");
   assertEquals(one([]), undefined);
   assertEquals(one(undefined), undefined);
@@ -56,14 +56,14 @@ Deno.test("buildRpcBody() shapes the IPA JSON-RPC envelope", () => {
 Deno.test("parseServers() flattens server_find rows", () => {
   const raw = [
     {
-      cn: ["freeipa1.ipa.shrug.pw"],
+      cn: ["ipa1.example.com"],
       ipamindomainlevel: ["0"],
       ipamaxdomainlevel: ["1"],
       enabled_role_servrole: ["CA server", "DNS server"],
       iparepltopomanagedsuffix_topologysuffix: ["domain", "ca"],
     },
     {
-      cn: ["freeipa2.ipa.shrug.pw"],
+      cn: ["ipa2.example.com"],
       ipamindomainlevel: ["0"],
       ipamaxdomainlevel: ["1"],
       // no roles, fallback suffix attribute name
@@ -72,14 +72,14 @@ Deno.test("parseServers() flattens server_find rows", () => {
   ];
   assertEquals(parseServers(raw), [
     {
-      fqdn: "freeipa1.ipa.shrug.pw",
+      fqdn: "ipa1.example.com",
       minDomainLevel: 0,
       maxDomainLevel: 1,
       roles: ["CA server", "DNS server"],
       managedSuffixes: ["domain", "ca"],
     },
     {
-      fqdn: "freeipa2.ipa.shrug.pw",
+      fqdn: "ipa2.example.com",
       minDomainLevel: 0,
       maxDomainLevel: 1,
       roles: [],
@@ -91,18 +91,18 @@ Deno.test("parseServers() flattens server_find rows", () => {
 Deno.test("parseSegments() flattens topologysegment_find edges", () => {
   const raw = [
     {
-      cn: ["freeipa1-to-freeipa2"],
-      iparepltoposegmentleftnode: ["freeipa1.ipa.shrug.pw"],
-      iparepltoposegmentrightnode: ["freeipa2.ipa.shrug.pw"],
+      cn: ["ipa1-to-ipa2"],
+      iparepltoposegmentleftnode: ["ipa1.example.com"],
+      iparepltoposegmentrightnode: ["ipa2.example.com"],
       iparepltoposegmentdirection: ["both"],
     },
   ];
   assertEquals(parseSegments("domain", raw), [
     {
       suffix: "domain",
-      name: "freeipa1-to-freeipa2",
-      left: "freeipa1.ipa.shrug.pw",
-      right: "freeipa2.ipa.shrug.pw",
+      name: "ipa1-to-ipa2",
+      left: "ipa1.example.com",
+      right: "ipa2.example.com",
       direction: "both",
     },
   ]);
@@ -110,8 +110,8 @@ Deno.test("parseSegments() flattens topologysegment_find edges", () => {
 
 Deno.test("mermaidNodeId() and segmentArrow() sanitize/route", () => {
   assertEquals(
-    mermaidNodeId("domain", "freeipa1.ipa.shrug.pw"),
-    "domain_freeipa1_ipa_shrug_pw",
+    mermaidNodeId("domain", "ipa1.example.com"),
+    "domain_ipa1_example_com",
   );
   assertEquals(segmentArrow("both"), "<-->");
   assertEquals(segmentArrow("left-right"), "-->");
@@ -119,14 +119,14 @@ Deno.test("mermaidNodeId() and segmentArrow() sanitize/route", () => {
 
 Deno.test("renderTopologyMermaid() groups segments into per-suffix subgraphs", () => {
   const mmd = renderTopologyMermaid({
-    server: "freeipa1.ipa.shrug.pw",
+    server: "ipa1.example.com",
     suffixes: [{ name: "domain", managedRoot: null }],
     segments: [
       {
         suffix: "domain",
         name: "f1-to-f2",
-        left: "freeipa1.ipa.shrug.pw",
-        right: "freeipa2.ipa.shrug.pw",
+        left: "ipa1.example.com",
+        right: "ipa2.example.com",
         direction: "both",
       },
     ],
@@ -135,7 +135,7 @@ Deno.test("renderTopologyMermaid() groups segments into per-suffix subgraphs", (
   assertEquals(mmd.startsWith("graph LR"), true);
   assertEquals(mmd.includes("subgraph domain"), true);
   assertEquals(
-    mmd.includes("domain_freeipa1_ipa_shrug_pw <--> domain_freeipa2_ipa_shrug_pw"),
+    mmd.includes("domain_ipa1_example_com <--> domain_ipa2_example_com"),
     true,
   );
 });

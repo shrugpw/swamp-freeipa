@@ -1,0 +1,46 @@
+# === PUBLIC MIRROR whitelist (github.com/shrugpw/swamp-freeipa) ===
+# This dir is BOTH the local swamp dev tree (nested per-package .swamp/ runtime
+# state + vault keys, CLAUDE.md, and the PRIVATE design/ doc with real infra)
+# AND the git checkout of the PUBLIC family mirror. Whitelist strategy: ignore
+# everything, then re-include only the published package files, so dev/secret/
+# infra state can NEVER be committed to the public repo.
+
+# Ignore everything at the root...
+/*
+
+# ...but keep this file and the top-level published docs.
+!/.gitignore
+!/README.md
+!/LICENSE.txt
+
+# Re-include the four package dirs so git descends into them.
+!/cert/
+!/domain/
+!/group/
+!/user/
+
+# Within EACH package, ignore everything then re-include only published files
+# (manifest, docs, and the extensions/ source — models, tests, reports).
+cert/*
+!cert/manifest.yaml
+!cert/README.md
+!cert/LICENSE.txt
+!cert/extensions/
+domain/*
+!domain/manifest.yaml
+!domain/README.md
+!domain/LICENSE.txt
+!domain/extensions/
+group/*
+!group/manifest.yaml
+!group/README.md
+!group/LICENSE.txt
+!group/extensions/
+user/*
+!user/manifest.yaml
+!user/README.md
+!user/LICENSE.txt
+!user/extensions/
+
+# Belt-and-suspenders: the PRIVATE design dir must NEVER be published.
+/design/
