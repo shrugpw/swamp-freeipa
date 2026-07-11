@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@shrug/freeipa/user"
+version: "2026.07.10.1"
+description: "Manage FreeIPA users over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/setEnabled writes, each with an audit trail and a confirm-guarded delete."
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - user.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - identity
+  - users

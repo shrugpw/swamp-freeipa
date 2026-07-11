@@ -1,0 +1,24 @@
+manifestVersion: 1
+name: "@shrug/freeipa/cert"
+version: "2026.07.10.1"
+description: "Issue, inspect, and revoke X.509 certificates for any FreeIPA principal (user/host/service) over the JSON-RPC API, with optional in-model RSA/EC keygen and vaulted private keys."
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - cert.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch() and generates keypairs with pure-JS node-forge; no host
+# binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - pki
+  - certificates
+  - radius
