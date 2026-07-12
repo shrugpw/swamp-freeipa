@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@shrug/freeipa/host"
+version: "2026.07.11.1"
+description: "Manage FreeIPA hosts over the JSON-RPC API: find/show read-only snapshots plus add/mod/del/disable writes and a desired-state sync reconcile, each with an audit trail and a confirm-guarded delete. add random:true vaults the one-time enrollment password; add/del take an optional idempotent flag."
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - host.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - identity
+  - hosts

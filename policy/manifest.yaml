@@ -1,0 +1,23 @@
+manifestVersion: 1
+name: "@shrug/freeipa/policy"
+version: "2026.07.11.1"
+description: "Manage FreeIPA sudo rules over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule, fan-out add-option/user/host/command, enable/disable, and a confirm-guarded delete, each with an audit trail. (Wave 1: sudo; HBAC and RBAC follow in Wave 2.)"
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - policy.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - identity
+  - policy
+  - sudo

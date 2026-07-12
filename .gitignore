@@ -13,10 +13,12 @@
 !/README.md
 !/LICENSE.txt
 
-# Re-include the four package dirs so git descends into them.
+# Re-include the package dirs so git descends into them.
 !/cert/
 !/domain/
 !/group/
+!/host/
+!/policy/
 !/user/
 
 # Within EACH package, ignore everything then re-include only published files
@@ -36,6 +38,16 @@ group/*
 !group/README.md
 !group/LICENSE.txt
 !group/extensions/
+host/*
+!host/manifest.yaml
+!host/README.md
+!host/LICENSE.txt
+!host/extensions/
+policy/*
+!policy/manifest.yaml
+!policy/README.md
+!policy/LICENSE.txt
+!policy/extensions/
 user/*
 !user/manifest.yaml
 !user/README.md
