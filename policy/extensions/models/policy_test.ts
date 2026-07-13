@@ -1,5 +1,5 @@
 /**
- * Unit tests for the `@shrug/freeipa/policy` model (Wave 1: sudo surface).
+ * Unit tests for the `@shrug/freeipa/policy` model (sudo + HBAC + RBAC surfaces).
  *
  * Two layers:
  *  - The pure value-shaping helpers (IPA's single-element array unwrapping,
@@ -23,6 +23,8 @@ import {
   isNotFound,
   model,
   one,
+  parseHbacRule,
+  parseRole,
   parseSudoRule,
   toBool,
   toInt,
@@ -657,6 +659,591 @@ Deno.test("sudoRuleDel idempotent still honors the confirm guard", async () => {
     );
     assertEquals(mock.jsonCalls.length, 0);
     assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ===========================================================================
+// HBAC surface
+// ===========================================================================
+
+Deno.test("parseHbacRule() flattens an HBAC rule entry and keeps raw", () => {
+  const entry = {
+    cn: ["allow-ssh"],
+    description: ["Allow SSH for web admins"],
+    ipaenabledflag: ["TRUE"],
+    accessruletype: ["allow"],
+    usercategory: ["all"],
+    memberuser_user: ["alice", "jdoe"],
+    memberhost_host: ["host1.example.com"],
+    memberservice_hbacsvc: ["sshd"],
+    dn: "ipaUniqueID=abc,cn=hbac,dc=example,dc=com",
+  };
+  assertEquals(parseHbacRule(entry), {
+    cn: "allow-ssh",
+    description: "Allow SSH for web admins",
+    enabled: true,
+    accessRuleType: "allow",
+    userCategory: "all",
+    hostCategory: undefined,
+    serviceCategory: undefined,
+    memberUsers: ["alice", "jdoe"],
+    memberGroups: [],
+    memberHosts: ["host1.example.com"],
+    memberHostGroups: [],
+    memberServices: ["sshd"],
+    memberServiceGroups: [],
+    raw: entry,
+  });
+});
+
+/** A minimal parsed IPA HBAC rule entry for result payloads. */
+const sshHbacEntry = {
+  cn: ["allow-ssh"],
+  ipaenabledflag: ["TRUE"],
+  accessruletype: ["allow"],
+};
+
+Deno.test("hbacRuleFind: snapshots matched rules into an `hbacRules` resource", async () => {
+  const mock = installFetch({
+    hbacrule_find: ok({
+      result: [sshHbacEntry],
+      count: 1,
+      summary: "1 HBAC rule matched",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleFind.execute({ criteria: "ssh" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_find"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "hbacRules");
+    assertEquals((writes[0].data.hbacRules as unknown[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleShow: snapshots a single rule into an `hbacRule` resource", async () => {
+  const mock = installFetch({ hbacrule_show: ok({ result: sshHbacEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleShow.execute({ cn: "allow-ssh" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_show"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "hbacRule");
+    assertEquals(
+      (writes[0].data.hbacRule as { cn: string }).cn,
+      "allow-ssh",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureHbacRule: writes attempt(success) then rule state, in order", async () => {
+  const mock = installFetch({ hbacrule_add: ok({ result: sshHbacEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureHbacRule.execute(
+      { cn: "allow-ssh", description: "Allow SSH", userCategory: "all" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_add"]);
+    const addCall = mock.jsonCalls.find((c) => c.command === "hbacrule_add");
+    assertEquals(
+      (addCall!.params as [string[], Record<string, unknown>])[1].usercategory,
+      "all",
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(writes[0].data.error, null);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureHbacRule idempotent: DuplicateEntry re-reads and records success", async () => {
+  const mock = installFetch({
+    hbacrule_add: err("DuplicateEntry", "HBAC rule allow-ssh exists", 4002),
+    hbacrule_show: ok({ result: sshHbacEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureHbacRule.execute({ cn: "allow-ssh" }, context);
+    // The duplicate is caught inside the attempt, so show follows add.
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "hbacrule_add",
+      "hbacrule_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals((writes[1].data.hbacRule as { cn: string }).cn, "allow-ssh");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleAddUser: fan-out multi-element lists reach IPA params", async () => {
+  const withUsers = {
+    ...sshHbacEntry,
+    memberuser_user: ["alice", "jdoe"],
+    memberuser_group: ["web-admins"],
+  };
+  const mock = installFetch({
+    hbacrule_add_user: ok({ completed: 3, failed: {}, result: withUsers }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleAddUser.execute(
+      { cn: "allow-ssh", users: ["alice", "jdoe"], groups: ["web-admins"] },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_add_user"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.user, ["alice", "jdoe"]);
+    assertEquals(opts.group, ["web-admins"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      3,
+    );
+    assertEquals(
+      (writes[1].data.hbacRule as { memberUsers: string[] }).memberUsers,
+      ["alice", "jdoe"],
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleAddService: fan-out services reach the add_service call", async () => {
+  const withSvcs = {
+    ...sshHbacEntry,
+    memberservice_hbacsvc: ["sshd", "sudo"],
+  };
+  const mock = installFetch({
+    hbacrule_add_service: ok({ completed: 2, failed: {}, result: withSvcs }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleAddService.execute(
+      { cn: "allow-ssh", services: ["sshd", "sudo"], serviceGroups: ["Sudo"] },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "hbacrule_add_service",
+    ]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.hbacsvc, ["sshd", "sudo"]);
+    assertEquals(opts.hbacsvcgroup, ["Sudo"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleAddHost: fan-out hosts + host groups reach IPA params", async () => {
+  const withHosts = {
+    ...sshHbacEntry,
+    memberhost_host: ["web1.example.com", "web2.example.com"],
+    memberhost_hostgroup: ["webservers"],
+  };
+  const mock = installFetch({
+    hbacrule_add_host: ok({ completed: 3, failed: {}, result: withHosts }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleAddHost.execute(
+      {
+        cn: "allow-ssh",
+        hosts: ["web1.example.com", "web2.example.com"],
+        hostgroups: ["webservers"],
+      },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_add_host"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.host, ["web1.example.com", "web2.example.com"]);
+    assertEquals(opts.hostgroup, ["webservers"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[1].data.hbacRule as { memberHosts: string[] }).memberHosts,
+      ["web1.example.com", "web2.example.com"],
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleSetEnabled: audits the toggle then re-reads rule state", async () => {
+  const mock = installFetch({
+    hbacrule_disable: ok({ result: true, value: "allow-ssh", summary: "Off" }),
+    hbacrule_show: ok({
+      result: { ...sshHbacEntry, ipaenabledflag: ["FALSE"] },
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleSetEnabled.execute(
+      { cn: "allow-ssh", enabled: false },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "hbacrule_disable",
+      "hbacrule_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "hbacRule"]);
+    assertEquals(writes[0].data.method, "hbacrule_disable");
+    assertEquals(
+      (writes[1].data.hbacRule as { enabled: boolean }).enabled,
+      false,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleDel: confirm:false throws before any transport or write", async () => {
+  const mock = installFetch({});
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.hbacRuleDel.execute(
+          { cn: "allow-ssh", confirm: false },
+          context,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+    assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleDel: confirm:true audits the delete, writes no state", async () => {
+  const mock = installFetch({
+    hbacrule_del: ok({
+      result: true,
+      value: ["allow-ssh"],
+      summary: "Deleted HBAC rule allow-ssh",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleDel.execute(
+      { cn: "allow-ssh", confirm: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("hbacRuleDel idempotent: NotFound records success, no state", async () => {
+  const mock = installFetch({
+    hbacrule_del: err("NotFound", "HBAC rule gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.hbacRuleDel.execute(
+      { cn: "gone", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["hbacrule_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+// ===========================================================================
+// RBAC surface
+// ===========================================================================
+
+Deno.test("parseRole() flattens a role entry and keeps raw", () => {
+  const entry = {
+    cn: ["helpdesk"],
+    description: ["Helpdesk operators"],
+    member_user: ["alice", "jdoe"],
+    member_group: ["support"],
+    memberof_privilege: ["Modify Users and Reset passwords"],
+    dn: "cn=helpdesk,cn=roles,cn=accounts,dc=example,dc=com",
+  };
+  assertEquals(parseRole(entry), {
+    cn: "helpdesk",
+    description: "Helpdesk operators",
+    memberUsers: ["alice", "jdoe"],
+    memberGroups: ["support"],
+    memberHosts: [],
+    memberHostGroups: [],
+    memberServices: [],
+    privileges: ["Modify Users and Reset passwords"],
+    raw: entry,
+  });
+});
+
+/** A minimal parsed IPA role entry for result payloads. */
+const helpdeskRoleEntry = {
+  cn: ["helpdesk"],
+  description: ["Helpdesk operators"],
+};
+
+Deno.test("roleFind: snapshots matched roles into a `roles` resource", async () => {
+  const mock = installFetch({
+    role_find: ok({
+      result: [helpdeskRoleEntry],
+      count: 1,
+      summary: "1 role matched",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleFind.execute({ criteria: "help" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_find"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "roles");
+    assertEquals((writes[0].data.roles as unknown[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleShow: snapshots a single role into a `role` resource", async () => {
+  const mock = installFetch({ role_show: ok({ result: helpdeskRoleEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleShow.execute({ cn: "helpdesk" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_show"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "role");
+    assertEquals((writes[0].data.role as { cn: string }).cn, "helpdesk");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureRole: writes attempt(success) then role state, in order", async () => {
+  const mock = installFetch({ role_add: ok({ result: helpdeskRoleEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureRole.execute(
+      { cn: "helpdesk", description: "Helpdesk operators" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_add"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "role"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals((writes[1].data.role as { cn: string }).cn, "helpdesk");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureRole idempotent: DuplicateEntry re-reads and records success", async () => {
+  const mock = installFetch({
+    role_add: err("DuplicateEntry", "role helpdesk exists", 4002),
+    role_show: ok({ result: helpdeskRoleEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureRole.execute({ cn: "helpdesk" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "role_add",
+      "role_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "role"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals((writes[1].data.role as { cn: string }).cn, "helpdesk");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleAddPrivilege: fan-out privileges reach the add_privilege call", async () => {
+  const withPrivs = {
+    ...helpdeskRoleEntry,
+    memberof_privilege: ["User Administrators", "Group Administrators"],
+  };
+  const mock = installFetch({
+    role_add_privilege: ok({ completed: 2, failed: {}, result: withPrivs }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleAddPrivilege.execute(
+      {
+        cn: "helpdesk",
+        privileges: ["User Administrators", "Group Administrators"],
+      },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_add_privilege"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.privilege, [
+      "User Administrators",
+      "Group Administrators",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "role"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[1].data.role as { privileges: string[] }).privileges,
+      ["User Administrators", "Group Administrators"],
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleAddMember: fan-out users + groups reach IPA params", async () => {
+  const withMembers = {
+    ...helpdeskRoleEntry,
+    member_user: ["alice", "jdoe"],
+    member_group: ["support"],
+  };
+  const mock = installFetch({
+    role_add_member: ok({ completed: 3, failed: {}, result: withMembers }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleAddMember.execute(
+      { cn: "helpdesk", users: ["alice", "jdoe"], groups: ["support"] },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_add_member"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.user, ["alice", "jdoe"]);
+    assertEquals(opts.group, ["support"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "role"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeFind: snapshots privileges read-only into a `privileges` resource", async () => {
+  const mock = installFetch({
+    privilege_find: ok({
+      result: [
+        { cn: ["User Administrators"], description: ["Manage users"] },
+        { cn: ["Group Administrators"], description: ["Manage groups"] },
+      ],
+      count: 2,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeFind.execute({ criteria: "admin" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["privilege_find"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "privileges");
+    assertEquals((writes[0].data.privileges as unknown[]).length, 2);
+    assertEquals(
+      (writes[0].data.privileges as Array<{ cn: string }>)[0].cn,
+      "User Administrators",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("permissionFind: snapshots permissions read-only into a `permissions` resource", async () => {
+  const mock = installFetch({
+    permission_find: ok({
+      result: [{ cn: ["System: Add Users"], description: ["Add users"] }],
+      count: 1,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.permissionFind.execute({ criteria: "user" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["permission_find"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "permissions");
+    assertEquals((writes[0].data.permissions as unknown[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleDel: confirm:false throws before any transport or write", async () => {
+  const mock = installFetch({});
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.roleDel.execute(
+          { cn: "helpdesk", confirm: false },
+          context,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+    assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleDel: confirm:true audits the delete, writes no state", async () => {
+  const mock = installFetch({
+    role_del: ok({
+      result: true,
+      value: ["helpdesk"],
+      summary: "Deleted role helpdesk",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleDel.execute(
+      { cn: "helpdesk", confirm: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("roleDel idempotent: NotFound records success, no state", async () => {
+  const mock = installFetch({
+    role_del: err("NotFound", "role gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.roleDel.execute(
+      { cn: "gone", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["role_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
   } finally {
     mock.restore();
   }

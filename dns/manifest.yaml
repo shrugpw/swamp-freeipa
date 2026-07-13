@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@shrug/freeipa/dns"
+version: "2026.07.12.1"
+description: "Manage FreeIPA DNS over the JSON-RPC API: zoneFind/zoneShow/recordFind read-only snapshots plus idempotent ensureZone/ensureForwardZone and a fan-out ensureRecords (add a list of records in one call), with confirm-guarded zoneDel/recordDel — each write carrying an audit trail. ensureRecords records partial applies honestly."
+
+repository: https://github.com/shrugpw/swamp-freeipa
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - dns.ts
+
+# Empty platforms == universal. The model talks HTTPS to the IPA JSON-RPC
+# endpoint via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - freeipa
+  - identity
+  - dns

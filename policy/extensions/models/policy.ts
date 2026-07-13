@@ -1,17 +1,26 @@
 /**
- * FreeIPA policy management model (Wave 1: sudo surface).
+ * FreeIPA policy management model (sudo + HBAC + RBAC).
  *
  * Connects to an existing FreeIPA server's JSON-RPC API to inspect and manage
- * sudo rules. `sudoRuleFind`/`sudoRuleShow` snapshot rules read-only;
- * `ensureSudoRule` creates them idempotently; `sudoRuleAddOption`/
- * `sudoRuleAddUser`/`sudoRuleAddHost`/`sudoRuleAddCommand` populate them (the
- * member methods fan out over lists in one call); `sudoRuleSetEnabled` toggles
- * them; and the destructive `sudoRuleDel` removes them. Every mutation records
- * an honest `attempt` audit resource on BOTH the success and failure paths (see
- * {@link recordAttempt}), the state resources (`sudoRule`/`sudoRules`) are
- * written only on success, and `sudoRuleDel` is gated behind an explicit
- * `confirm` flag plus a `live` pre-flight existence check. This is the policy
- * surface of the `@shrug/freeipa/*` family (HBAC and RBAC arrive in Wave 2).
+ * three policy surfaces, each following the same shape:
+ *
+ *  - **sudo:** `sudoRuleFind`/`sudoRuleShow` snapshot rules read-only;
+ *    `ensureSudoRule` creates them idempotently; `sudoRuleAddOption`/
+ *    `sudoRuleAddUser`/`sudoRuleAddHost`/`sudoRuleAddCommand` populate them;
+ *    `sudoRuleSetEnabled` toggles them; `sudoRuleDel` removes them.
+ *  - **HBAC:** `hbacRuleFind`/`hbacRuleShow`, idempotent `ensureHbacRule`,
+ *    fan-out `hbacRuleAddUser`/`hbacRuleAddHost`/`hbacRuleAddService`,
+ *    `hbacRuleSetEnabled`, and `hbacRuleDel`.
+ *  - **RBAC:** `roleFind`/`roleShow`, idempotent `ensureRole`, fan-out
+ *    `roleAddPrivilege`/`roleAddMember`, read-only `privilegeFind`/
+ *    `permissionFind`, and `roleDel`.
+ *
+ * The member/privilege methods fan out over lists in one call. Every mutation
+ * records an honest `attempt` audit resource on BOTH the success and failure
+ * paths (see {@link recordAttempt}), the state resources are written only on
+ * success, and each destructive `*Del` is gated behind an explicit `confirm`
+ * flag plus a `live` pre-flight existence check. This is the policy surface of
+ * the `@shrug/freeipa/*` family.
  *
  * ## Transport
  *
@@ -501,6 +510,228 @@ export type SudoRule = z.infer<typeof SudoRuleSchema>;
 /** A multi sudo-rule snapshot resource. */
 export type SudoRules = z.infer<typeof SudoRulesSchema>;
 
+// ---------------------------------------------------------------------------
+// HBAC-rule value-shaping — parse IPA HBAC rule entries into friendly rows.
+// ---------------------------------------------------------------------------
+
+/** A parsed FreeIPA HBAC rule row (single-element IPA arrays unwrapped). */
+const HbacRuleRowSchema = z.object({
+  cn: z.string().describe("HBAC rule name (IPA `cn`)"),
+  description: z.string().optional().describe("Free-text description"),
+  enabled: z.boolean().describe(
+    "Rule enabled state (IPA `ipaenabledflag`); true == enabled",
+  ),
+  accessRuleType: z.string().optional().describe(
+    "Access rule type (IPA `accessruletype`); normally `allow`",
+  ),
+  userCategory: z.string().optional().describe(
+    "User category (IPA `usercategory`, e.g. `all`) when set instead of explicit users",
+  ),
+  hostCategory: z.string().optional().describe(
+    "Host category (IPA `hostcategory`, e.g. `all`) when set instead of explicit hosts",
+  ),
+  serviceCategory: z.string().optional().describe(
+    "Service category (IPA `servicecategory`, e.g. `all`) when set instead of explicit services",
+  ),
+  memberUsers: z.array(z.string()).describe(
+    "Users this rule applies to (IPA `memberuser_user`)",
+  ),
+  memberGroups: z.array(z.string()).describe(
+    "User groups this rule applies to (IPA `memberuser_group`)",
+  ),
+  memberHosts: z.array(z.string()).describe(
+    "Hosts this rule applies to (IPA `memberhost_host`)",
+  ),
+  memberHostGroups: z.array(z.string()).describe(
+    "Host groups this rule applies to (IPA `memberhost_hostgroup`)",
+  ),
+  memberServices: z.array(z.string()).describe(
+    "HBAC services this rule applies to (IPA `memberservice_hbacsvc`)",
+  ),
+  memberServiceGroups: z.array(z.string()).describe(
+    "HBAC service groups this rule applies to (IPA `memberservice_hbacsvcgroup`)",
+  ),
+  raw: z.record(z.string(), z.unknown()).describe(
+    "Full IPA HBAC rule entry, unmodified — nothing is lost",
+  ),
+});
+
+/** A single parsed HBAC rule + provenance — the `hbacRule` state resource. */
+const HbacRuleSchema = z.object({
+  server: z.string(),
+  hbacRule: HbacRuleRowSchema,
+  retrievedAt: z.iso.datetime(),
+});
+
+/** A snapshot of many HBAC rules — the `hbacRules` state resource. */
+const HbacRulesSchema = z.object({
+  server: z.string(),
+  hbacRules: z.array(HbacRuleRowSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+/**
+ * Map a raw IPA HBAC rule entry (a `hbacrule_find`/`hbacrule_show`/
+ * `hbacrule_add` result row) into a friendly {@link HbacRuleRowSchema} row,
+ * keeping the untouched entry under `raw` so no attribute is ever lost.
+ *
+ * Mirrors {@link parseSudoRule}: single-element IPA arrays are unwrapped and the
+ * full entry is preserved verbatim under `raw`.
+ *
+ * @param entry A single HBAC rule entry from an IPA result.
+ * @returns The flattened HBAC rule row.
+ */
+export function parseHbacRule(
+  entry: Record<string, unknown>,
+): z.infer<typeof HbacRuleRowSchema> {
+  return {
+    cn: String(one(entry.cn) ?? ""),
+    description: one(entry.description) as string | undefined,
+    enabled: toBool(entry.ipaenabledflag),
+    accessRuleType: one(entry.accessruletype) as string | undefined,
+    userCategory: one(entry.usercategory) as string | undefined,
+    hostCategory: one(entry.hostcategory) as string | undefined,
+    serviceCategory: one(entry.servicecategory) as string | undefined,
+    memberUsers: toStrArray(entry.memberuser_user),
+    memberGroups: toStrArray(entry.memberuser_group),
+    memberHosts: toStrArray(entry.memberhost_host),
+    memberHostGroups: toStrArray(entry.memberhost_hostgroup),
+    memberServices: toStrArray(entry.memberservice_hbacsvc),
+    memberServiceGroups: toStrArray(entry.memberservice_hbacsvcgroup),
+    raw: entry,
+  };
+}
+
+/** A parsed HBAC rule row produced by {@link parseHbacRule}. */
+export type HbacRuleRow = z.infer<typeof HbacRuleRowSchema>;
+/** A single HBAC-rule snapshot resource. */
+export type HbacRule = z.infer<typeof HbacRuleSchema>;
+/** A multi HBAC-rule snapshot resource. */
+export type HbacRules = z.infer<typeof HbacRulesSchema>;
+
+// ---------------------------------------------------------------------------
+// RBAC value-shaping — parse IPA role/privilege/permission entries into rows.
+// ---------------------------------------------------------------------------
+
+/** A parsed FreeIPA role row (single-element IPA arrays unwrapped). */
+const RoleRowSchema = z.object({
+  cn: z.string().describe("Role name (IPA `cn`)"),
+  description: z.string().optional().describe("Free-text description"),
+  memberUsers: z.array(z.string()).describe(
+    "Users granted this role (IPA `member_user`)",
+  ),
+  memberGroups: z.array(z.string()).describe(
+    "User groups granted this role (IPA `member_group`)",
+  ),
+  memberHosts: z.array(z.string()).describe(
+    "Hosts granted this role (IPA `member_host`)",
+  ),
+  memberHostGroups: z.array(z.string()).describe(
+    "Host groups granted this role (IPA `member_hostgroup`)",
+  ),
+  memberServices: z.array(z.string()).describe(
+    "Services granted this role (IPA `member_service`)",
+  ),
+  privileges: z.array(z.string()).describe(
+    "Privileges bundled into this role (IPA `memberof_privilege`)",
+  ),
+  raw: z.record(z.string(), z.unknown()).describe(
+    "Full IPA role entry, unmodified — nothing is lost",
+  ),
+});
+
+/** A single parsed role + provenance — the `role` state resource. */
+const RoleSchema = z.object({
+  server: z.string(),
+  role: RoleRowSchema,
+  retrievedAt: z.iso.datetime(),
+});
+
+/** A snapshot of many roles — the `roles` state resource. */
+const RolesSchema = z.object({
+  server: z.string(),
+  roles: z.array(RoleRowSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+/** A parsed FreeIPA privilege/permission row (read-only inspection). */
+const RbacEntryRowSchema = z.object({
+  cn: z.string().describe("Entry name (IPA `cn`)"),
+  description: z.string().optional().describe("Free-text description"),
+  raw: z.record(z.string(), z.unknown()).describe(
+    "Full IPA entry, unmodified — nothing is lost",
+  ),
+});
+
+/** A read-only snapshot of privileges — the `privileges` state resource. */
+const PrivilegesSchema = z.object({
+  server: z.string(),
+  privileges: z.array(RbacEntryRowSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+/** A read-only snapshot of permissions — the `permissions` state resource. */
+const PermissionsSchema = z.object({
+  server: z.string(),
+  permissions: z.array(RbacEntryRowSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+/**
+ * Map a raw IPA role entry (a `role_find`/`role_show`/`role_add` result row)
+ * into a friendly {@link RoleRowSchema} row, keeping the untouched entry under
+ * `raw` so no attribute is ever lost. Mirrors {@link parseSudoRule}.
+ *
+ * @param entry A single role entry from an IPA result.
+ * @returns The flattened role row.
+ */
+export function parseRole(
+  entry: Record<string, unknown>,
+): z.infer<typeof RoleRowSchema> {
+  return {
+    cn: String(one(entry.cn) ?? ""),
+    description: one(entry.description) as string | undefined,
+    memberUsers: toStrArray(entry.member_user),
+    memberGroups: toStrArray(entry.member_group),
+    memberHosts: toStrArray(entry.member_host),
+    memberHostGroups: toStrArray(entry.member_hostgroup),
+    memberServices: toStrArray(entry.member_service),
+    privileges: toStrArray(entry.memberof_privilege),
+    raw: entry,
+  };
+}
+
+/**
+ * Map a raw IPA privilege or permission entry into a minimal
+ * {@link RbacEntryRowSchema} row for the read-only `privilegeFind`/
+ * `permissionFind` snapshots, keeping the untouched entry under `raw`.
+ *
+ * @param entry A single privilege/permission entry from an IPA result.
+ * @returns The flattened `{cn, description?, raw}` row.
+ */
+export function parseRbacEntry(
+  entry: Record<string, unknown>,
+): z.infer<typeof RbacEntryRowSchema> {
+  return {
+    cn: String(one(entry.cn) ?? ""),
+    description: one(entry.description) as string | undefined,
+    raw: entry,
+  };
+}
+
+/** A parsed role row produced by {@link parseRole}. */
+export type RoleRow = z.infer<typeof RoleRowSchema>;
+/** A single role snapshot resource. */
+export type Role = z.infer<typeof RoleSchema>;
+/** A multi role snapshot resource. */
+export type Roles = z.infer<typeof RolesSchema>;
+/** A parsed privilege/permission row produced by {@link parseRbacEntry}. */
+export type RbacEntryRow = z.infer<typeof RbacEntryRowSchema>;
+/** A read-only privileges snapshot resource. */
+export type Privileges = z.infer<typeof PrivilegesSchema>;
+/** A read-only permissions snapshot resource. */
+export type Permissions = z.infer<typeof PermissionsSchema>;
+
 /**
  * Predicate: is this error IPA's "entry already exists" (`DuplicateEntry`,
  * code 4002)? Used to make `add` idempotent — a duplicate means the user is
@@ -586,12 +817,12 @@ interface CheckContext {
   };
 }
 
-/** FreeIPA policy management model definition (Wave 1: sudo). */
+/** FreeIPA policy management model definition (sudo + HBAC + RBAC). */
 export const model = {
   type: "@shrug/freeipa/policy",
-  version: "2026.07.11.1",
+  version: "2026.07.12.1",
   description:
-    "Manage FreeIPA sudo rules over the JSON-RPC API: sudoRuleFind/sudoRuleShow read-only snapshots plus idempotent ensureSudoRule, fan-out sudoRuleAddOption/AddUser/AddHost/AddCommand, sudoRuleSetEnabled, and a confirm-guarded sudoRuleDel, each with an audit trail. (Wave 2 adds HBAC and RBAC.)",
+    "Manage FreeIPA sudo, HBAC, and RBAC policy over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule/ensureHbacRule/ensureRole, fan-out member/option/privilege methods, enable/disable toggles, read-only privilegeFind/permissionFind, and confirm-guarded deletes — each mutation with an audit trail.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "sudoRules": {
@@ -604,6 +835,45 @@ export const model = {
     "sudoRule": {
       description: "Snapshot of a single sudo rule (parsed row + raw entry)",
       schema: SudoRuleSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "hbacRules": {
+      description:
+        "Snapshot of HBAC rules matching a find (array of parsed rows)",
+      schema: HbacRulesSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "hbacRule": {
+      description: "Snapshot of a single HBAC rule (parsed row + raw entry)",
+      schema: HbacRuleSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "roles": {
+      description: "Snapshot of roles matching a find (array of parsed rows)",
+      schema: RolesSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "role": {
+      description: "Snapshot of a single role (parsed row + raw entry)",
+      schema: RoleSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "privileges": {
+      description:
+        "Read-only snapshot of privileges matching a find (name + description + raw)",
+      schema: PrivilegesSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "permissions": {
+      description:
+        "Read-only snapshot of permissions matching a find (name + description + raw)",
+      schema: PermissionsSchema,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -653,6 +923,94 @@ export const model = {
             pass: false,
             errors: [
               `sudo rule "${cn}" not found on ${context.globalArgs.server}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+    "hbacrule-exists": {
+      description:
+        "Verify the most recently snapshotted HBAC rule still exists before a destructive delete.",
+      labels: ["live"],
+      appliesTo: ["hbacRuleDel"],
+      execute: async (
+        context: CheckContext,
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        // Pre-flight checks cannot see the method's arguments, so this verifies
+        // against the last `hbacRule` snapshot this model recorded. The method's
+        // own confirm:true guard and IPA's NotFound error remain the per-name
+        // safeguards; this catches a stale-target delete against a live server.
+        const bytes = await context.dataRepository.getContent(
+          context.modelType,
+          context.modelId,
+          "hbacRule",
+        );
+        if (!bytes) return { pass: true };
+        let cn = "";
+        try {
+          const snap = JSON.parse(new TextDecoder().decode(bytes)) as {
+            hbacRule?: { cn?: string };
+          };
+          cn = snap.hbacRule?.cn ?? "";
+        } catch {
+          return { pass: true };
+        }
+        if (!cn) return { pass: true };
+        const client = await ipaLogin(context.globalArgs);
+        try {
+          await client.call("hbacrule_show", [cn], {});
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `HBAC rule "${cn}" not found on ${context.globalArgs.server}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+    "role-exists": {
+      description:
+        "Verify the most recently snapshotted role still exists before a destructive delete.",
+      labels: ["live"],
+      appliesTo: ["roleDel"],
+      execute: async (
+        context: CheckContext,
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        // Pre-flight checks cannot see the method's arguments, so this verifies
+        // against the last `role` snapshot this model recorded. The method's own
+        // confirm:true guard and IPA's NotFound error remain the per-name
+        // safeguards; this catches a stale-target delete against a live server.
+        const bytes = await context.dataRepository.getContent(
+          context.modelType,
+          context.modelId,
+          "role",
+        );
+        if (!bytes) return { pass: true };
+        let cn = "";
+        try {
+          const snap = JSON.parse(new TextDecoder().decode(bytes)) as {
+            role?: { cn?: string };
+          };
+          cn = snap.role?.cn ?? "";
+        } catch {
+          return { pass: true };
+        }
+        if (!cn) return { pass: true };
+        const client = await ipaLogin(context.globalArgs);
+        try {
+          await client.call("role_show", [cn], {});
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `role "${cn}" not found on ${context.globalArgs.server}: ${
                 e instanceof Error ? e.message : String(e)
               }`,
             ],
@@ -1160,6 +1518,814 @@ export const model = {
               if (idempotent && isNotFound(e)) {
                 context.logger.info(
                   "sudorule_del: {cn} already absent, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    hbacRuleFind: {
+      description:
+        "Snapshot HBAC rules matching an optional search criteria (read-only).",
+      arguments: z.object({
+        criteria: z
+          .string()
+          .optional()
+          .describe("Free-text search; omit to list all HBAC rules"),
+      }),
+      execute: async (
+        args: { criteria?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Finding HBAC rules matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("hbacrule_find", [args.criteria ?? ""], {
+          all: true,
+        });
+        const hbacRules = ((res.result ?? []) as Array<Record<string, unknown>>)
+          .map(parseHbacRule);
+        context.logger.info("Found {count} HBAC rules", {
+          count: hbacRules.length,
+        });
+
+        const handle = await context.writeResource("hbacRules", "hbacRules", {
+          server: cfg.server,
+          hbacRules,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    hbacRuleShow: {
+      description: "Snapshot a single HBAC rule by name (read-only).",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn) to fetch"),
+      }),
+      execute: async (
+        args: { cn: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Showing HBAC rule {cn}", { cn: args.cn });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("hbacrule_show", [args.cn], {
+          all: true,
+        });
+        const hbacRule = parseHbacRule(
+          (res.result ?? {}) as Record<string, unknown>,
+        );
+        context.logger.info("Retrieved HBAC rule {cn}", { cn: args.cn });
+
+        const handle = await context.writeResource("hbacRule", "hbacRule", {
+          server: cfg.server,
+          hbacRule,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    ensureHbacRule: {
+      description:
+        "Idempotently ensure an HBAC rule exists (hbacrule_add). Swallows DuplicateEntry and re-reads via hbacrule_show, so re-runs are safe. Writes the HBAC rule state on success; audits both paths.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn)"),
+        description: z
+          .string()
+          .optional()
+          .describe("Free-text description (IPA `description`)"),
+        userCategory: z
+          .string()
+          .optional()
+          .describe("User category (IPA `usercategory`, e.g. `all`)"),
+        hostCategory: z
+          .string()
+          .optional()
+          .describe("Host category (IPA `hostcategory`, e.g. `all`)"),
+        serviceCategory: z
+          .string()
+          .optional()
+          .describe("Service category (IPA `servicecategory`, e.g. `all`)"),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra raw IPA hbacrule_add options (lowercase IPA option names), merged last",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          userCategory?: string;
+          hostCategory?: string;
+          serviceCategory?: string;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const options: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.userCategory !== undefined
+            ? { usercategory: args.userCategory }
+            : {}),
+          ...(args.hostCategory !== undefined
+            ? { hostcategory: args.hostCategory }
+            : {}),
+          ...(args.serviceCategory !== undefined
+            ? { servicecategory: args.serviceCategory }
+            : {}),
+          ...(args.options ?? {}),
+        };
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "hbacrule_add",
+          ["hbacrule_add", "hbacrule_show"],
+          {
+            cn: args.cn,
+            description: args.description ?? null,
+            userCategory: args.userCategory ?? null,
+            hostCategory: args.hostCategory ?? null,
+            serviceCategory: args.serviceCategory ?? null,
+          },
+          async () => {
+            try {
+              return await client.call("hbacrule_add", [args.cn], options);
+            } catch (e) {
+              // Idempotent create: an existing rule is a no-op success. Re-read
+              // the live entry so the recorded response and the `hbacRule` state
+              // reflect reality. Non-duplicate errors still propagate.
+              if (isDuplicateEntry(e)) {
+                context.logger.info(
+                  "hbacrule_add: {cn} already exists, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return await client.call("hbacrule_show", [args.cn], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
+        );
+
+        const hbacRule = parseHbacRule(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "hbacRule",
+          "hbacRule",
+          {
+            server: cfg.server,
+            hbacRule,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    hbacRuleAddUser: {
+      description:
+        "Add users and/or user groups to an HBAC rule in one call (hbacrule_add_user). Fan-out: pass lists of users and groups. Surfaces IPA's `failed` structure in the audit response; writes the updated HBAC rule state on success.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn)"),
+        users: z
+          .array(z.string())
+          .optional()
+          .describe("User logins to add (IPA `user`)"),
+        groups: z
+          .array(z.string())
+          .optional()
+          .describe("User groups to add (IPA `group`)"),
+      }),
+      execute: async (
+        args: { cn: string; users?: string[]; groups?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "hbacrule_add_user",
+          ["hbacrule_add_user"],
+          { cn: args.cn, users: args.users ?? [], groups: args.groups ?? [] },
+          async () => {
+            const res = await client.call("hbacrule_add_user", [args.cn], {
+              user: args.users ?? [],
+              group: args.groups ?? [],
+            });
+            // `completed` count and `failed` structure are surfaced so a
+            // silent half-fail is visible in the attempt audit.
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const hbacRule = parseHbacRule(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "hbacRule",
+          "hbacRule",
+          {
+            server: cfg.server,
+            hbacRule,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    hbacRuleAddHost: {
+      description:
+        "Add hosts and/or host groups to an HBAC rule in one call (hbacrule_add_host). Fan-out: pass lists of hosts and hostgroups. Surfaces IPA's `failed` structure in the audit response; writes the updated HBAC rule state on success.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn)"),
+        hosts: z
+          .array(z.string())
+          .optional()
+          .describe("Host FQDNs to add (IPA `host`)"),
+        hostgroups: z
+          .array(z.string())
+          .optional()
+          .describe("Host groups to add (IPA `hostgroup`)"),
+      }),
+      execute: async (
+        args: { cn: string; hosts?: string[]; hostgroups?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "hbacrule_add_host",
+          ["hbacrule_add_host"],
+          {
+            cn: args.cn,
+            hosts: args.hosts ?? [],
+            hostgroups: args.hostgroups ?? [],
+          },
+          async () => {
+            const res = await client.call("hbacrule_add_host", [args.cn], {
+              host: args.hosts ?? [],
+              hostgroup: args.hostgroups ?? [],
+            });
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const hbacRule = parseHbacRule(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "hbacRule",
+          "hbacRule",
+          {
+            server: cfg.server,
+            hbacRule,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    hbacRuleAddService: {
+      description:
+        "Add HBAC services and/or service groups to an HBAC rule in one call (hbacrule_add_service). Fan-out: pass lists of hbacsvcs and hbacsvcgroups. Surfaces IPA's `failed` structure in the audit response; writes the updated HBAC rule state on success.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn)"),
+        services: z
+          .array(z.string())
+          .optional()
+          .describe("HBAC services to add (IPA `hbacsvc`)"),
+        serviceGroups: z
+          .array(z.string())
+          .optional()
+          .describe("HBAC service groups to add (IPA `hbacsvcgroup`)"),
+      }),
+      execute: async (
+        args: { cn: string; services?: string[]; serviceGroups?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "hbacrule_add_service",
+          ["hbacrule_add_service"],
+          {
+            cn: args.cn,
+            services: args.services ?? [],
+            serviceGroups: args.serviceGroups ?? [],
+          },
+          async () => {
+            const res = await client.call("hbacrule_add_service", [args.cn], {
+              hbacsvc: args.services ?? [],
+              hbacsvcgroup: args.serviceGroups ?? [],
+            });
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const hbacRule = parseHbacRule(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "hbacRule",
+          "hbacRule",
+          {
+            server: cfg.server,
+            hbacRule,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    hbacRuleSetEnabled: {
+      description:
+        "Enable or disable an HBAC rule (hbacrule_enable / hbacrule_disable). Writes the updated HBAC rule state on success; audits both paths.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn)"),
+        enabled: z
+          .boolean()
+          .describe("true -> hbacrule_enable, false -> hbacrule_disable"),
+      }),
+      execute: async (
+        args: { cn: string; enabled: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const command = args.enabled ? "hbacrule_enable" : "hbacrule_disable";
+
+        const { handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          command,
+          [command],
+          { cn: args.cn, enabled: args.enabled },
+          () => client.call(command, [args.cn], {}),
+        );
+
+        // State resource, success-only: re-read the rule so the snapshot
+        // reflects the new enabled state (enable/disable return a boolean, not
+        // the entry itself).
+        const showRes = await client.call("hbacrule_show", [args.cn], {
+          all: true,
+        });
+        const hbacRule = parseHbacRule(
+          (showRes.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "hbacRule",
+          "hbacRule",
+          {
+            server: cfg.server,
+            hbacRule,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    hbacRuleDel: {
+      description:
+        "Delete an HBAC rule (hbacrule_del). Requires confirm:true; audits both paths.",
+      arguments: z.object({
+        cn: z.string().describe("HBAC rule name (cn) to delete"),
+        confirm: z
+          .boolean()
+          .describe("Must be true; a guard against accidental deletion"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent rule (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; confirm: boolean; idempotent?: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        if (args.confirm !== true) {
+          throw new Error(
+            `Refusing to delete HBAC rule "${args.cn}": pass confirm:true to proceed`,
+          );
+        }
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+
+        const { handle } = await recordAttempt(
+          context,
+          args.cn,
+          "hbacrule_del",
+          ["hbacrule_del"],
+          { cn: args.cn, idempotent },
+          async () => {
+            try {
+              return await client.call("hbacrule_del", [args.cn], {});
+            } catch (e) {
+              // Idempotent delete: an already-gone rule is a no-op success.
+              // Non-NotFound errors and the default (idempotent:false) path
+              // still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "hbacrule_del: {cn} already absent, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    roleFind: {
+      description:
+        "Snapshot roles matching an optional search criteria (read-only).",
+      arguments: z.object({
+        criteria: z
+          .string()
+          .optional()
+          .describe("Free-text search; omit to list all roles"),
+      }),
+      execute: async (
+        args: { criteria?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Finding roles matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("role_find", [args.criteria ?? ""], {
+          all: true,
+        });
+        const roles = ((res.result ?? []) as Array<Record<string, unknown>>)
+          .map(parseRole);
+        context.logger.info("Found {count} roles", { count: roles.length });
+
+        const handle = await context.writeResource("roles", "roles", {
+          server: cfg.server,
+          roles,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    roleShow: {
+      description: "Snapshot a single role by name (read-only).",
+      arguments: z.object({
+        cn: z.string().describe("Role name (cn) to fetch"),
+      }),
+      execute: async (
+        args: { cn: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Showing role {cn}", { cn: args.cn });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("role_show", [args.cn], {
+          all: true,
+        });
+        const role = parseRole(
+          (res.result ?? {}) as Record<string, unknown>,
+        );
+        context.logger.info("Retrieved role {cn}", { cn: args.cn });
+
+        const handle = await context.writeResource("role", "role", {
+          server: cfg.server,
+          role,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    ensureRole: {
+      description:
+        "Idempotently ensure a role exists (role_add). Swallows DuplicateEntry and re-reads via role_show, so re-runs are safe. Writes the role state on success; audits both paths. NOTE: role/privilege mutation is privilege-escalation sensitive — the scoped service account is deliberately NOT granted Delegation Administrator, so this operates only within the rights the operator already holds.",
+      arguments: z.object({
+        cn: z.string().describe("Role name (cn)"),
+        description: z
+          .string()
+          .optional()
+          .describe("Free-text description (IPA `description`)"),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra raw IPA role_add options (lowercase IPA option names), merged last",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const options: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.options ?? {}),
+        };
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "role_add",
+          ["role_add", "role_show"],
+          { cn: args.cn, description: args.description ?? null },
+          async () => {
+            try {
+              return await client.call("role_add", [args.cn], options);
+            } catch (e) {
+              // Idempotent create: an existing role is a no-op success. Re-read
+              // the live entry so the recorded response and the `role` state
+              // reflect reality. Non-duplicate errors still propagate.
+              if (isDuplicateEntry(e)) {
+                context.logger.info(
+                  "role_add: {cn} already exists, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return await client.call("role_show", [args.cn], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
+        );
+
+        const role = parseRole(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("role", "role", {
+          server: cfg.server,
+          role,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    roleAddPrivilege: {
+      description:
+        "Add privileges to a role in one call (role_add_privilege). Fan-out: pass a list of privileges. Surfaces IPA's `failed` structure in the audit response; writes the updated role state on success. NOTE: privilege-escalation sensitive — bounded by the operator's own rights (no Delegation Administrator on the scoped account).",
+      arguments: z.object({
+        cn: z.string().describe("Role name (cn)"),
+        privileges: z
+          .array(z.string())
+          .describe("Privileges to add to the role (IPA `privilege`)"),
+      }),
+      execute: async (
+        args: { cn: string; privileges: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "role_add_privilege",
+          ["role_add_privilege"],
+          { cn: args.cn, privileges: args.privileges },
+          async () => {
+            const res = await client.call("role_add_privilege", [args.cn], {
+              privilege: args.privileges,
+            });
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const role = parseRole(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("role", "role", {
+          server: cfg.server,
+          role,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    roleAddMember: {
+      description:
+        "Add users and/or user groups to a role in one call (role_add_member). Fan-out: pass lists of users and groups. Surfaces IPA's `failed` structure in the audit response; writes the updated role state on success.",
+      arguments: z.object({
+        cn: z.string().describe("Role name (cn)"),
+        users: z
+          .array(z.string())
+          .optional()
+          .describe("User logins to add (IPA `user`)"),
+        groups: z
+          .array(z.string())
+          .optional()
+          .describe("User groups to add (IPA `group`)"),
+      }),
+      execute: async (
+        args: { cn: string; users?: string[]; groups?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "role_add_member",
+          ["role_add_member"],
+          { cn: args.cn, users: args.users ?? [], groups: args.groups ?? [] },
+          async () => {
+            const res = await client.call("role_add_member", [args.cn], {
+              user: args.users ?? [],
+              group: args.groups ?? [],
+            });
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const role = parseRole(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("role", "role", {
+          server: cfg.server,
+          role,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    privilegeFind: {
+      description:
+        "Snapshot privileges matching an optional search criteria (read-only). Useful for discovering the privilege names to feed roleAddPrivilege.",
+      arguments: z.object({
+        criteria: z
+          .string()
+          .optional()
+          .describe("Free-text search; omit to list all privileges"),
+      }),
+      execute: async (
+        args: { criteria?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Finding privileges matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("privilege_find", [args.criteria ?? ""], {
+          all: true,
+        });
+        const privileges =
+          ((res.result ?? []) as Array<Record<string, unknown>>)
+            .map(parseRbacEntry);
+        context.logger.info("Found {count} privileges", {
+          count: privileges.length,
+        });
+
+        const handle = await context.writeResource("privileges", "privileges", {
+          server: cfg.server,
+          privileges,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    permissionFind: {
+      description:
+        "Snapshot permissions matching an optional search criteria (read-only). Useful for discovering the permission names bundled into privileges.",
+      arguments: z.object({
+        criteria: z
+          .string()
+          .optional()
+          .describe("Free-text search; omit to list all permissions"),
+      }),
+      execute: async (
+        args: { criteria?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Finding permissions matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
+        const client = await ipaLogin(cfg);
+        const res = await client.call(
+          "permission_find",
+          [args.criteria ?? ""],
+          { all: true },
+        );
+        const permissions =
+          ((res.result ?? []) as Array<Record<string, unknown>>)
+            .map(parseRbacEntry);
+        context.logger.info("Found {count} permissions", {
+          count: permissions.length,
+        });
+
+        const handle = await context.writeResource(
+          "permissions",
+          "permissions",
+          {
+            server: cfg.server,
+            permissions,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    roleDel: {
+      description:
+        "Delete a role (role_del). Requires confirm:true; audits both paths. NOTE: role deletion is privilege-escalation sensitive and admin-scoped by design.",
+      arguments: z.object({
+        cn: z.string().describe("Role name (cn) to delete"),
+        confirm: z
+          .boolean()
+          .describe("Must be true; a guard against accidental deletion"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent role (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; confirm: boolean; idempotent?: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        if (args.confirm !== true) {
+          throw new Error(
+            `Refusing to delete role "${args.cn}": pass confirm:true to proceed`,
+          );
+        }
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+
+        const { handle } = await recordAttempt(
+          context,
+          args.cn,
+          "role_del",
+          ["role_del"],
+          { cn: args.cn, idempotent },
+          async () => {
+            try {
+              return await client.call("role_del", [args.cn], {});
+            } catch (e) {
+              // Idempotent delete: an already-gone role is a no-op success.
+              // Non-NotFound errors and the default (idempotent:false) path
+              // still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "role_del: {cn} already absent, treating as no-op (idempotent)",
                   { cn: args.cn },
                 );
                 return { result: true, alreadyAbsent: true };

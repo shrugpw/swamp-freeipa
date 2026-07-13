@@ -15,6 +15,7 @@
 
 # Re-include the package dirs so git descends into them.
 !/cert/
+!/dns/
 !/domain/
 !/group/
 !/host/
@@ -28,6 +29,11 @@ cert/*
 !cert/README.md
 !cert/LICENSE.txt
 !cert/extensions/
+dns/*
+!dns/manifest.yaml
+!dns/README.md
+!dns/LICENSE.txt
+!dns/extensions/
 domain/*
 !domain/manifest.yaml
 !domain/README.md

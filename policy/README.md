@@ -1,20 +1,26 @@
 # @shrug/freeipa/policy
 
 A swamp model for **managing [FreeIPA](https://www.freeipa.org/) policy** over
-its JSON-RPC API. Wave 1 covers the **sudo** surface: it logs in with a session
-password, snapshots sudo rules (`sudoRuleFind`/`sudoRuleShow`) as versioned
-resources, creates them idempotently (`ensureSudoRule`), populates them
-(`sudoRuleAddOption`/`sudoRuleAddUser`/`sudoRuleAddHost`/`sudoRuleAddCommand` —
-the member methods fan out over lists in one call), toggles them
-(`sudoRuleSetEnabled`), and deletes them (`sudoRuleDel`) — recording an honest
-audit trail for every write and guarding the destructive delete behind an
-explicit confirmation.
+its JSON-RPC API. It covers three policy surfaces — **sudo**, **HBAC**, and
+**RBAC** (roles/privileges/permissions) — each following the same shape: log in
+with a session password, snapshot rules as versioned resources, create them
+idempotently, populate them with fan-out member methods (a single call per list),
+toggle them, and delete them behind an explicit confirmation — recording an
+honest audit trail for every write.
+
+- **sudo:** `sudoRuleFind`/`sudoRuleShow`, `ensureSudoRule`,
+  `sudoRuleAddOption`/`sudoRuleAddUser`/`sudoRuleAddHost`/`sudoRuleAddCommand`,
+  `sudoRuleSetEnabled`, `sudoRuleDel`.
+- **HBAC:** `hbacRuleFind`/`hbacRuleShow`, `ensureHbacRule`,
+  `hbacRuleAddUser`/`hbacRuleAddHost`/`hbacRuleAddService`,
+  `hbacRuleSetEnabled`, `hbacRuleDel`.
+- **RBAC:** `roleFind`/`roleShow`, `ensureRole`,
+  `roleAddPrivilege`/`roleAddMember`, read-only `privilegeFind`/`permissionFind`,
+  `roleDel`.
 
 It is the policy surface of the `@shrug/freeipa/*` family; the read-only
 domain-inspection surface lives in `@shrug/freeipa/domain`, and identity objects
 live in `@shrug/freeipa/user`, `@shrug/freeipa/group`, and `@shrug/freeipa/host`.
-HBAC and RBAC (role/privilege/permission) methods arrive in a Wave 2 version bump
-of this same package.
 
 ## Installation
 
@@ -80,6 +86,51 @@ swamp model method run my-ipa-sudo sudoRuleDel --input cn=allow-web --input conf
 swamp model method run my-ipa-sudo sudoRuleDel --input cn=allow-web --input confirm=true --input idempotent=true
 ```
 
+### HBAC
+
+```sh
+# Snapshot HBAC rules (optionally filtered) / one rule
+swamp model method run my-ipa-sudo hbacRuleFind --input criteria=ssh
+swamp model method run my-ipa-sudo hbacRuleShow --input cn=allow-ssh
+
+# Ensure a rule exists (idempotent) -> "hbacRule" (state) + "attempt" (audit)
+swamp model method run my-ipa-sudo ensureHbacRule --input cn=allow-ssh
+
+# Fan-out: add users/groups, hosts/hostgroups, and services in one call each
+swamp model method run my-ipa-sudo hbacRuleAddUser \
+  --input cn=allow-ssh --input 'users=["alice","jdoe"]' --input 'groups=["web-admins"]'
+swamp model method run my-ipa-sudo hbacRuleAddHost \
+  --input cn=allow-ssh --input 'hosts=["host1.example.com"]' --input 'hostgroups=["webservers"]'
+swamp model method run my-ipa-sudo hbacRuleAddService \
+  --input cn=allow-ssh --input 'services=["sshd"]'
+
+# Enable / disable, then delete (confirm:true REQUIRED)
+swamp model method run my-ipa-sudo hbacRuleSetEnabled --input cn=allow-ssh --input enabled=false
+swamp model method run my-ipa-sudo hbacRuleDel --input cn=allow-ssh --input confirm=true
+```
+
+### RBAC
+
+```sh
+# Read-only discovery: find privilege / permission names
+swamp model method run my-ipa-sudo privilegeFind --input criteria=admin
+swamp model method run my-ipa-sudo permissionFind --input criteria=user
+
+# Snapshot roles / one role
+swamp model method run my-ipa-sudo roleFind --input criteria=help
+swamp model method run my-ipa-sudo roleShow --input cn=helpdesk
+
+# Ensure a role exists (idempotent), then attach privileges and members (fan-out)
+swamp model method run my-ipa-sudo ensureRole --input cn=helpdesk --input 'description=Helpdesk operators'
+swamp model method run my-ipa-sudo roleAddPrivilege \
+  --input cn=helpdesk --input 'privileges=["User Administrators","Group Administrators"]'
+swamp model method run my-ipa-sudo roleAddMember \
+  --input cn=helpdesk --input 'users=["alice"]' --input 'groups=["support"]'
+
+# Delete a role (confirm:true REQUIRED)
+swamp model method run my-ipa-sudo roleDel --input cn=helpdesk --input confirm=true
+```
+
 ## Methods
 
 | Method               | IPA command(s)                           | Reads/Writes | State resource            | Audit |
@@ -99,6 +150,63 @@ Parsed sudo rule rows expose `cn`, `description`, `enabled` (from
 `memberUsers[]`, `memberGroups[]`, `memberHosts[]`, `memberHostGroups[]`,
 `allowCommands[]`, `allowCommandGroups[]`, and `sudoOptions[]`, plus a `raw`
 passthrough of the complete IPA entry so nothing is lost.
+
+### HBAC methods
+
+Host-Based Access Control rules gate which users may reach which services on
+which hosts. The surface mirrors sudo one-for-one.
+
+| Method               | IPA command(s)                            | Reads/Writes | State resource            | Audit |
+| -------------------- | ----------------------------------------- | ------------ | ------------------------- | ----- |
+| `hbacRuleFind`       | `hbacrule_find [criteria\|""]`            | read         | `hbacRules`               | —     |
+| `hbacRuleShow`       | `hbacrule_show [cn]`                       | read         | `hbacRule`                | —     |
+| `ensureHbacRule`     | `hbacrule_add [cn]` (+ `hbacrule_show`)    | write        | `hbacRule` (on success)   | ✓     |
+| `hbacRuleAddUser`    | `hbacrule_add_user [cn]`                   | write        | `hbacRule` (on success)   | ✓     |
+| `hbacRuleAddHost`    | `hbacrule_add_host [cn]`                   | write        | `hbacRule` (on success)   | ✓     |
+| `hbacRuleAddService` | `hbacrule_add_service [cn]`                | write        | `hbacRule` (on success)   | ✓     |
+| `hbacRuleSetEnabled` | `hbacrule_enable`/`hbacrule_disable`       | write        | `hbacRule` (on success)   | ✓     |
+| `hbacRuleDel`        | `hbacrule_del [cn]`                        | write        | — (nothing to store)      | ✓     |
+
+Parsed HBAC rule rows expose `cn`, `description`, `enabled`, `accessRuleType`,
+`userCategory`/`hostCategory`/`serviceCategory`, `memberUsers[]`,
+`memberGroups[]`, `memberHosts[]`, `memberHostGroups[]`, `memberServices[]`,
+`memberServiceGroups[]`, plus a `raw` passthrough. `ensureHbacRule` is idempotent
+(swallows `DuplicateEntry` and re-reads via `hbacrule_show`); the member methods
+are fan-out (lists in one call); `hbacRuleDel` requires `confirm:true` and is
+backed by the `hbacrule-exists` live pre-flight check.
+
+### RBAC methods
+
+Role-Based Access Control bundles privileges (which bundle permissions) and
+grants them to users/groups via roles.
+
+| Method            | IPA command(s)              | Reads/Writes | State resource          | Audit |
+| ----------------- | --------------------------- | ------------ | ----------------------- | ----- |
+| `roleFind`        | `role_find [criteria\|""]`  | read         | `roles`                 | —     |
+| `roleShow`        | `role_show [cn]`            | read         | `role`                  | —     |
+| `ensureRole`      | `role_add [cn]` (+ `role_show`) | write    | `role` (on success)     | ✓     |
+| `roleAddPrivilege`| `role_add_privilege [cn]`   | write        | `role` (on success)     | ✓     |
+| `roleAddMember`   | `role_add_member [cn]`      | write        | `role` (on success)     | ✓     |
+| `privilegeFind`   | `privilege_find [criteria\|""]` | read     | `privileges`            | —     |
+| `permissionFind`  | `permission_find [criteria\|""]` | read    | `permissions`           | —     |
+| `roleDel`         | `role_del [cn]`             | write        | — (nothing to store)    | ✓     |
+
+Parsed role rows expose `cn`, `description`, `memberUsers[]`, `memberGroups[]`,
+`memberHosts[]`, `memberHostGroups[]`, `memberServices[]`, `privileges[]`, plus a
+`raw` passthrough. `privilegeFind`/`permissionFind` are read-only discovery
+snapshots — use them to find the privilege names to feed `roleAddPrivilege`.
+`ensureRole` is idempotent; `roleAddPrivilege`/`roleAddMember` are fan-out;
+`roleDel` requires `confirm:true` and is backed by the `role-exists` live
+pre-flight check.
+
+> **RBAC is privilege-escalation sensitive.** Creating a role and attaching
+> privileges to it grants rights, so a scoped write service account is
+> deliberately **not** granted the "Delegation Administrator" privilege.
+> `ensureRole`/`roleAddPrivilege` therefore operate only **within the rights the
+> operator already holds** — they cannot mint rights the caller does not have.
+> Keep role/privilege mutation to a principal you have explicitly authorized for
+> RBAC administration; the read-only `privilegeFind`/`permissionFind` are safe to
+> run under any authenticated principal.
 
 ### Idempotency & reconcile
 
@@ -138,8 +246,9 @@ half-fail is visible.
 Every mutation follows the **three-way persistence rule** shared across the
 `@shrug/freeipa/*` write family:
 
-- **State** (`sudoRule`/`sudoRules`) is written **only on success**. A failed
-  write never leaves a misleading "live" snapshot behind.
+- **State** (the `sudoRule`/`sudoRules`, `hbacRule`/`hbacRules`, `role`/`roles`,
+  and read-only `privileges`/`permissions` snapshots) is written **only on
+  success**. A failed write never leaves a misleading "live" snapshot behind.
 - **Irreplaceable material** generated mid-operation (a private key, a signed
   cert) is persisted by the method the instant it is real, before any later
   throw — the policy model generates none, but the contract is shared with
@@ -151,14 +260,17 @@ Every mutation follows the **three-way persistence rule** shared across the
 
 ### Confirm guard + pre-flight check
 
-`sudoRuleDel` takes a required `confirm: boolean` and throws immediately unless
-it is exactly `true`. A `live`-labeled pre-flight check (`sudorule-exists`,
-scoped to `sudoRuleDel`) additionally logs in and `sudorule_show`-asserts the
-last-snapshotted rule still exists on the server, failing the run when it is
-absent. (Pre-flight checks cannot see a method's arguments, so the check
-verifies against the most recent `sudoRule` snapshot; the `confirm` guard and
-IPA's own NotFound error are the per-name safeguards.) Skip it with
-`--skip-check-label live` in offline runs.
+Each destructive delete — `sudoRuleDel`, `hbacRuleDel`, and `roleDel` — takes a
+required `confirm: boolean` and throws immediately unless it is exactly `true`. A
+matching `live`-labeled pre-flight check (`sudorule-exists`, `hbacrule-exists`,
+`role-exists`, each scoped to its delete method) additionally logs in and
+`*_show`-asserts the last-snapshotted object still exists on the server, failing
+the run when it is absent. (Pre-flight checks cannot see a method's arguments, so
+each check verifies against the most recent snapshot of its object; the `confirm`
+guard and IPA's own NotFound error are the per-name safeguards.) Skip them with
+`--skip-check-label live` in offline runs. Each delete also accepts an optional
+`idempotent: boolean` (default `false`) that treats an already-absent target
+(IPA `NotFound`) as a success no-op; the `confirm` guard always applies.
 
 ## License
 
