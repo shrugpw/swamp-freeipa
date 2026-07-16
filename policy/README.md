@@ -1,12 +1,12 @@
 # @shrug/freeipa/policy
 
 A swamp model for **managing [FreeIPA](https://www.freeipa.org/) policy** over
-its JSON-RPC API. It covers three policy surfaces — **sudo**, **HBAC**, and
-**RBAC** (roles/privileges/permissions) — each following the same shape: log in
-with a session password, snapshot rules as versioned resources, create them
-idempotently, populate them with fan-out member methods (a single call per list),
-toggle them, and delete them behind an explicit confirmation — recording an
-honest audit trail for every write.
+its JSON-RPC API. It covers five policy surfaces — **sudo**, **HBAC**, **RBAC**
+(roles/privileges/permissions), **privilege**, and **CA ACL** — each following
+the same shape: log in with a session password, snapshot rules as versioned
+resources, create them idempotently, populate them with fan-out member methods
+(a single call per list), toggle them, and delete them behind an explicit
+confirmation — recording an honest audit trail for every write.
 
 - **sudo:** `sudoRuleFind`/`sudoRuleShow`, `ensureSudoRule`,
   `sudoRuleAddOption`/`sudoRuleAddUser`/`sudoRuleAddHost`/`sudoRuleAddCommand`,
@@ -17,6 +17,18 @@ honest audit trail for every write.
 - **RBAC:** `roleFind`/`roleShow`, `ensureRole`,
   `roleAddPrivilege`/`roleAddMember`, read-only `privilegeFind`/`permissionFind`,
   `roleDel`.
+- **privilege:** `privilegeShow`, `ensurePrivilege`, fan-out
+  `privilegeAddPermission`, `privilegeDel`.
+- **CA ACL:** `caAclFind`/`caAclShow`, `ensureCaAcl`, fan-out
+  `caAclAddCertprofile`/`caAclAddUser`, `caAclSetEnabled`, `caAclDel`.
+
+> **Privilege escalation note.** The privilege and CA-ACL surfaces are
+> escalation-sensitive and admin/break-glass scoped: the scoped service account
+> is deliberately **not** granted
+> `Delegation Administrator`, so those mutations run only within rights the
+> operator already holds. A CA ACL governs who may obtain certificates; a
+> privilege bundles permissions into roles. The code is auth-agnostic — this is
+> an operational note.
 
 It is the policy surface of the `@shrug/freeipa/*` family; the read-only
 domain-inspection surface lives in `@shrug/freeipa/domain`, and identity objects
@@ -208,6 +220,60 @@ pre-flight check.
 > RBAC administration; the read-only `privilegeFind`/`permissionFind` are safe to
 > run under any authenticated principal.
 
+### Privilege methods
+
+A privilege bundles permissions; roles then bundle privileges. These methods
+build and inspect a privilege (e.g. the custom `cert-issuers` privilege).
+
+| Method                   | IPA command(s)                            | Reads/Writes | State resource            | Audit |
+| ------------------------ | ----------------------------------------- | ------------ | ------------------------- | ----- |
+| `privilegeShow`          | `privilege_show [cn]`                      | read         | `privilege`               | —     |
+| `ensurePrivilege`        | `privilege_add [cn]` (+ `privilege_show`)  | write        | `privilege` (on success)  | ✓     |
+| `privilegeAddPermission` | `privilege_add_permission [cn]`            | write        | `privilege` (on success)  | ✓     |
+| `privilegeDel`           | `privilege_del [cn]`                       | write        | — (nothing to store)      | ✓     |
+
+Parsed privilege rows expose `cn`, `description`, `permissions[]` (merged from
+IPA's `member_permission`/`memberof_permission`), plus a `raw` passthrough.
+`ensurePrivilege` is idempotent (swallows `DuplicateEntry`, re-reads via
+`privilege_show`); `privilegeAddPermission` is **fan-out** over a list of
+permissions and surfaces IPA's `completed`/`failed`/`result` structure in the
+audit (an already-member re-add returns `completed:0` + a `failed` payload and
+does **not** throw); `privilegeDel` requires `confirm:true` and is backed by the
+`privilege-exists` live pre-flight check.
+
+### CA ACL methods
+
+A CA ACL (`caacl`) defines which principals may obtain which certificate profiles
+from the CA — e.g. the `user-cert-acl` ACL that lets user certs be issued
+within policy instead of via an ignore-ACL bypass. Note IPA's CLI flags are
+plural (`--certprofiles`/`--users`/`--groups`) but the JSON-RPC option names are
+singular (`certprofile`/`user`/`group`).
+
+| Method                | IPA command(s)                        | Reads/Writes | State resource        | Audit |
+| --------------------- | ------------------------------------- | ------------ | --------------------- | ----- |
+| `caAclFind`           | `caacl_find [criteria\|""]`           | read         | `caAcls`              | —     |
+| `caAclShow`           | `caacl_show [cn]`                     | read         | `caAcl`               | —     |
+| `ensureCaAcl`         | `caacl_add [cn]` (+ `caacl_show`)     | write        | `caAcl` (on success)  | ✓     |
+| `caAclAddCertprofile` | `caacl_add_profile [cn]`              | write        | `caAcl` (on success)  | ✓     |
+| `caAclAddUser`        | `caacl_add_user [cn]`                 | write        | `caAcl` (on success)  | ✓     |
+| `caAclSetEnabled`     | `caacl_enable`/`caacl_disable [cn]`   | write        | `caAcl` (on success)  | ✓     |
+| `caAclDel`            | `caacl_del [cn]`                      | write        | — (nothing to store)  | ✓     |
+
+Parsed CA ACL rows expose `cn`, `description`, `enabled`, `userCategory`,
+`certprofiles[]`, `users[]`, `groups[]`, `hosts[]`, `services[]`, plus a `raw`
+passthrough. `ensureCaAcl` takes an optional raw `options` map (e.g.
+`{ usercategory: "all" }`) and is idempotent; `caAclAddCertprofile`/`caAclAddUser`
+are **fan-out**; `caAclSetEnabled` toggles enable/disable and re-reads the ACL
+for state; `caAclDel` requires `confirm:true` and is backed by the `caacl-exists`
+live pre-flight check.
+
+> **Both surfaces are privilege-escalation sensitive** in the same way RBAC is: a
+> privilege grants rights once bundled into a role, and a CA ACL controls
+> certificate issuance. Keep their mutation to an explicitly authorized principal
+> — the scoped write account is deliberately **not** granted "Delegation
+> Administrator". The read-only `privilegeShow`/`caAclFind`/`caAclShow` are safe
+> under any authenticated principal.
+
 ### Idempotency & reconcile
 
 `ensureSudoRule` is idempotent by construction: an already-existing rule (IPA
@@ -247,8 +313,9 @@ Every mutation follows the **three-way persistence rule** shared across the
 `@shrug/freeipa/*` write family:
 
 - **State** (the `sudoRule`/`sudoRules`, `hbacRule`/`hbacRules`, `role`/`roles`,
-  and read-only `privileges`/`permissions` snapshots) is written **only on
-  success**. A failed write never leaves a misleading "live" snapshot behind.
+  `privilege`, `caAcl`/`caAcls`, and read-only `privileges`/`permissions`
+  snapshots) is written **only on success**. A failed write never leaves a
+  misleading "live" snapshot behind.
 - **Irreplaceable material** generated mid-operation (a private key, a signed
   cert) is persisted by the method the instant it is real, before any later
   throw — the policy model generates none, but the contract is shared with
@@ -260,10 +327,11 @@ Every mutation follows the **three-way persistence rule** shared across the
 
 ### Confirm guard + pre-flight check
 
-Each destructive delete — `sudoRuleDel`, `hbacRuleDel`, and `roleDel` — takes a
-required `confirm: boolean` and throws immediately unless it is exactly `true`. A
-matching `live`-labeled pre-flight check (`sudorule-exists`, `hbacrule-exists`,
-`role-exists`, each scoped to its delete method) additionally logs in and
+Each destructive delete — `sudoRuleDel`, `hbacRuleDel`, `roleDel`,
+`privilegeDel`, and `caAclDel` — takes a required `confirm: boolean` and throws
+immediately unless it is exactly `true`. A matching `live`-labeled pre-flight
+check (`sudorule-exists`, `hbacrule-exists`, `role-exists`, `privilege-exists`,
+`caacl-exists`, each scoped to its delete method) additionally logs in and
 `*_show`-asserts the last-snapshotted object still exists on the server, failing
 the run when it is absent. (Pre-flight checks cannot see a method's arguments, so
 each check verifies against the most recent snapshot of its object; the `confirm`

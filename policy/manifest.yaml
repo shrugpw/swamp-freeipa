@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@shrug/freeipa/policy"
-version: "2026.07.12.1"
-description: "Manage FreeIPA sudo, HBAC, and RBAC policy over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule/ensureHbacRule/ensureRole, fan-out member/option/privilege methods, enable/disable toggles, read-only privilege/permission discovery, and confirm-guarded deletes, each mutation with an audit trail."
+version: "2026.07.16.1"
+description: "Manage FreeIPA sudo, HBAC, RBAC, privilege, and CA-ACL policy over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule/ensureHbacRule/ensureRole/ensurePrivilege/ensureCaAcl, fan-out member/option/privilege/permission/certprofile methods, enable/disable toggles, read-only privilege/permission/CA-ACL discovery, and confirm-guarded deletes, each mutation with an audit trail."
 
 repository: https://github.com/shrugpw/swamp-freeipa
 
@@ -23,3 +23,5 @@ labels:
   - sudo
   - hbac
   - rbac
+  - privilege
+  - caacl

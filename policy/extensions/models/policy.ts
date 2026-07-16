@@ -1,8 +1,8 @@
 /**
- * FreeIPA policy management model (sudo + HBAC + RBAC).
+ * FreeIPA policy management model (sudo + HBAC + RBAC + privilege + CA ACL).
  *
  * Connects to an existing FreeIPA server's JSON-RPC API to inspect and manage
- * three policy surfaces, each following the same shape:
+ * five policy surfaces, each following the same shape:
  *
  *  - **sudo:** `sudoRuleFind`/`sudoRuleShow` snapshot rules read-only;
  *    `ensureSudoRule` creates them idempotently; `sudoRuleAddOption`/
@@ -14,6 +14,16 @@
  *  - **RBAC:** `roleFind`/`roleShow`, idempotent `ensureRole`, fan-out
  *    `roleAddPrivilege`/`roleAddMember`, read-only `privilegeFind`/
  *    `permissionFind`, and `roleDel`.
+ *  - **privilege:** `privilegeShow`, idempotent `ensurePrivilege`, fan-out
+ *    `privilegeAddPermission`, and `privilegeDel`.
+ *  - **CA ACL:** `caAclFind`/`caAclShow`, idempotent `ensureCaAcl`, fan-out
+ *    `caAclAddCertprofile`/`caAclAddUser`, `caAclSetEnabled`, and `caAclDel`.
+ *
+ * The privilege and CA-ACL surfaces are privilege-escalation sensitive and
+ * admin/break-glass scoped: the scoped service account
+ * is deliberately NOT granted `Delegation Administrator`, so those mutations run
+ * only within rights the operator already holds. (The code is auth-agnostic;
+ * this is an operational note.)
  *
  * The member/privilege methods fan out over lists in one call. Every mutation
  * records an honest `attempt` audit resource on BOTH the success and failure
@@ -732,6 +742,186 @@ export type Privileges = z.infer<typeof PrivilegesSchema>;
 /** A read-only permissions snapshot resource. */
 export type Permissions = z.infer<typeof PermissionsSchema>;
 
+// ---------------------------------------------------------------------------
+// Privilege + CA-ACL value-shaping — parse IPA privilege/caacl entries.
+//
+// Two defensive coercions shared by both parsers below. Beyond the usual
+// single-element-array unwrapping ({@link one}/{@link toStrArray}), IPA
+// occasionally renders name-valued attributes as `{ "__dns_name__": "fqdn." }`
+// objects rather than plain strings (a real bug that bit the `dns` package's
+// parsers — see the family memory). These coercions reduce such an object to
+// its string so a stray wrapped value never becomes `"[object Object]"`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Coerce a single IPA attribute value to a string, unwrapping both a
+ * single-element array and the `{ "__dns_name__": … }` object wire form.
+ *
+ * @param v A raw attribute value.
+ * @returns The string value; empty string when absent.
+ */
+export function caaclStr(v: unknown): string {
+  const s = one(v);
+  if (s && typeof s === "object" && "__dns_name__" in s) {
+    return String((s as { __dns_name__: unknown }).__dns_name__ ?? "");
+  }
+  return s === undefined || s === null ? "" : String(s);
+}
+
+/**
+ * Coerce a raw IPA attribute value to an array of strings, unwrapping each
+ * `{ "__dns_name__": … }` object and dropping empties. Mirrors
+ * {@link toStrArray} but defends against the object wire form.
+ *
+ * @param v A raw attribute value (scalar, array, or absent).
+ * @returns A string array (empty when absent).
+ */
+export function caaclStrArray(v: unknown): string[] {
+  if (v === undefined || v === null) return [];
+  return (Array.isArray(v) ? v : [v])
+    .map((x) =>
+      x && typeof x === "object" && "__dns_name__" in x
+        ? String((x as { __dns_name__: unknown }).__dns_name__ ?? "")
+        : String(x)
+    )
+    .filter((s) => s.length > 0);
+}
+
+/** Merge two string arrays, de-duplicating while preserving first-seen order. */
+function mergeDedup(a: string[], b: string[]): string[] {
+  return [...new Set([...a, ...b])];
+}
+
+/** A parsed FreeIPA privilege row (single-element IPA arrays unwrapped). */
+const PrivilegeRowSchema = z.object({
+  cn: z.string().describe("Privilege name (IPA `cn`)"),
+  description: z.string().optional().describe("Free-text description"),
+  permissions: z.array(z.string()).describe(
+    "Permissions bundled into this privilege (IPA `member_permission` / `memberof_permission`)",
+  ),
+  raw: z.record(z.string(), z.unknown()).describe(
+    "Full IPA privilege entry, unmodified — nothing is lost",
+  ),
+});
+
+/** A single parsed privilege + provenance — the `privilege` state resource. */
+const PrivilegeSchema = z.object({
+  server: z.string(),
+  privilege: PrivilegeRowSchema,
+  retrievedAt: z.iso.datetime(),
+});
+
+/**
+ * Map a raw IPA privilege entry (a `privilege_show`/`privilege_add`/
+ * `privilege_add_permission` result row) into a friendly
+ * {@link PrivilegeRowSchema} row, keeping the untouched entry under `raw`.
+ * Mirrors {@link parseRole}; the richer read (with permissions) that
+ * `privilegeShow` uses, versus the minimal {@link parseRbacEntry} that the
+ * read-only `privilegeFind` snapshot keeps.
+ *
+ * @param entry A single privilege entry from an IPA result.
+ * @returns The flattened privilege row.
+ */
+export function parsePrivilege(
+  entry: Record<string, unknown>,
+): z.infer<typeof PrivilegeRowSchema> {
+  return {
+    cn: caaclStr(entry.cn),
+    description: one(entry.description) as string | undefined,
+    permissions: mergeDedup(
+      caaclStrArray(entry.member_permission),
+      caaclStrArray(entry.memberof_permission),
+    ),
+    raw: entry,
+  };
+}
+
+/** A parsed privilege row produced by {@link parsePrivilege}. */
+export type PrivilegeRow = z.infer<typeof PrivilegeRowSchema>;
+/** A single privilege snapshot resource. */
+export type Privilege = z.infer<typeof PrivilegeSchema>;
+
+/** A parsed FreeIPA CA ACL row (single-element IPA arrays unwrapped). */
+const CaAclRowSchema = z.object({
+  cn: z.string().describe("CA ACL name (IPA `cn`)"),
+  description: z.string().optional().describe("Free-text description"),
+  enabled: z.boolean().describe(
+    "ACL enabled state (IPA `ipaenabledflag`); true == enabled",
+  ),
+  userCategory: z.string().optional().describe(
+    "User category (IPA `usercategory`, e.g. `all`) when set instead of explicit users",
+  ),
+  certprofiles: z.array(z.string()).describe(
+    "Certificate profiles this ACL permits (IPA `ipamembercertprofile_certprofile` / `member_certprofile`)",
+  ),
+  users: z.array(z.string()).describe(
+    "Users this ACL applies to (IPA `memberuser_user`)",
+  ),
+  groups: z.array(z.string()).describe(
+    "User groups this ACL applies to (IPA `memberuser_group`)",
+  ),
+  hosts: z.array(z.string()).describe(
+    "Hosts this ACL applies to (IPA `memberhost_host`)",
+  ),
+  services: z.array(z.string()).describe(
+    "Services this ACL applies to (IPA `memberservice_service`)",
+  ),
+  raw: z.record(z.string(), z.unknown()).describe(
+    "Full IPA CA ACL entry, unmodified — nothing is lost",
+  ),
+});
+
+/** A single parsed CA ACL + provenance — the `caAcl` state resource. */
+const CaAclSchema = z.object({
+  server: z.string(),
+  caAcl: CaAclRowSchema,
+  retrievedAt: z.iso.datetime(),
+});
+
+/** A snapshot of many CA ACLs — the `caAcls` state resource. */
+const CaAclsSchema = z.object({
+  server: z.string(),
+  caAcls: z.array(CaAclRowSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+/**
+ * Map a raw IPA CA ACL entry (a `caacl_find`/`caacl_show`/`caacl_add` or
+ * `caacl_add_profile`/`caacl_add_user` result row) into a friendly
+ * {@link CaAclRowSchema} row, keeping the untouched entry under `raw`.
+ * Mirrors {@link parseSudoRule}; certprofile members and the cn are read via
+ * the {@link caaclStr}/{@link caaclStrArray} object-wire-form-safe coercions.
+ *
+ * @param entry A single CA ACL entry from an IPA result.
+ * @returns The flattened CA ACL row.
+ */
+export function parseCaAcl(
+  entry: Record<string, unknown>,
+): z.infer<typeof CaAclRowSchema> {
+  return {
+    cn: caaclStr(entry.cn),
+    description: one(entry.description) as string | undefined,
+    enabled: toBool(entry.ipaenabledflag),
+    userCategory: one(entry.usercategory) as string | undefined,
+    certprofiles: mergeDedup(
+      caaclStrArray(entry.ipamembercertprofile_certprofile),
+      caaclStrArray(entry.member_certprofile),
+    ),
+    users: toStrArray(entry.memberuser_user),
+    groups: toStrArray(entry.memberuser_group),
+    hosts: toStrArray(entry.memberhost_host),
+    services: toStrArray(entry.memberservice_service),
+    raw: entry,
+  };
+}
+
+/** A parsed CA ACL row produced by {@link parseCaAcl}. */
+export type CaAclRow = z.infer<typeof CaAclRowSchema>;
+/** A single CA ACL snapshot resource. */
+export type CaAcl = z.infer<typeof CaAclSchema>;
+/** A multi CA ACL snapshot resource. */
+export type CaAcls = z.infer<typeof CaAclsSchema>;
+
 /**
  * Predicate: is this error IPA's "entry already exists" (`DuplicateEntry`,
  * code 4002)? Used to make `add` idempotent — a duplicate means the user is
@@ -817,12 +1007,12 @@ interface CheckContext {
   };
 }
 
-/** FreeIPA policy management model definition (sudo + HBAC + RBAC). */
+/** FreeIPA policy management model definition (sudo + HBAC + RBAC + privilege + CA ACL). */
 export const model = {
   type: "@shrug/freeipa/policy",
-  version: "2026.07.12.1",
+  version: "2026.07.16.1",
   description:
-    "Manage FreeIPA sudo, HBAC, and RBAC policy over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule/ensureHbacRule/ensureRole, fan-out member/option/privilege methods, enable/disable toggles, read-only privilegeFind/permissionFind, and confirm-guarded deletes — each mutation with an audit trail.",
+    "Manage FreeIPA sudo, HBAC, RBAC, privilege, and CA-ACL policy over the JSON-RPC API: find/show read-only snapshots plus idempotent ensureSudoRule/ensureHbacRule/ensureRole/ensurePrivilege/ensureCaAcl, fan-out member/option/privilege/permission/certprofile methods, enable/disable toggles, read-only privilegeFind/permissionFind/privilegeShow/caAclFind, and confirm-guarded deletes — each mutation with an audit trail.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "sudoRules": {
@@ -874,6 +1064,25 @@ export const model = {
       description:
         "Read-only snapshot of permissions matching a find (name + description + raw)",
       schema: PermissionsSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "privilege": {
+      description:
+        "Snapshot of a single privilege (parsed row incl. bundled permissions + raw entry)",
+      schema: PrivilegeSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "caAcls": {
+      description: "Snapshot of CA ACLs matching a find (array of parsed rows)",
+      schema: CaAclsSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "caAcl": {
+      description: "Snapshot of a single CA ACL (parsed row + raw entry)",
+      schema: CaAclSchema,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -1011,6 +1220,95 @@ export const model = {
             pass: false,
             errors: [
               `role "${cn}" not found on ${context.globalArgs.server}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+    "privilege-exists": {
+      description:
+        "Verify the most recently snapshotted privilege still exists before a destructive delete.",
+      labels: ["live"],
+      appliesTo: ["privilegeDel"],
+      execute: async (
+        context: CheckContext,
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        // Pre-flight checks cannot see the method's arguments, so this verifies
+        // against the last `privilege` snapshot this model recorded. The
+        // method's own confirm:true guard and IPA's NotFound error remain the
+        // per-name safeguards; this catches a stale-target delete against a
+        // live server.
+        const bytes = await context.dataRepository.getContent(
+          context.modelType,
+          context.modelId,
+          "privilege",
+        );
+        if (!bytes) return { pass: true };
+        let cn = "";
+        try {
+          const snap = JSON.parse(new TextDecoder().decode(bytes)) as {
+            privilege?: { cn?: string };
+          };
+          cn = snap.privilege?.cn ?? "";
+        } catch {
+          return { pass: true };
+        }
+        if (!cn) return { pass: true };
+        const client = await ipaLogin(context.globalArgs);
+        try {
+          await client.call("privilege_show", [cn], {});
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `privilege "${cn}" not found on ${context.globalArgs.server}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+    "caacl-exists": {
+      description:
+        "Verify the most recently snapshotted CA ACL still exists before a destructive delete.",
+      labels: ["live"],
+      appliesTo: ["caAclDel"],
+      execute: async (
+        context: CheckContext,
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        // Pre-flight checks cannot see the method's arguments, so this verifies
+        // against the last `caAcl` snapshot this model recorded. The method's
+        // own confirm:true guard and IPA's NotFound error remain the per-name
+        // safeguards; this catches a stale-target delete against a live server.
+        const bytes = await context.dataRepository.getContent(
+          context.modelType,
+          context.modelId,
+          "caAcl",
+        );
+        if (!bytes) return { pass: true };
+        let cn = "";
+        try {
+          const snap = JSON.parse(new TextDecoder().decode(bytes)) as {
+            caAcl?: { cn?: string };
+          };
+          cn = snap.caAcl?.cn ?? "";
+        } catch {
+          return { pass: true };
+        }
+        if (!cn) return { pass: true };
+        const client = await ipaLogin(context.globalArgs);
+        try {
+          await client.call("caacl_show", [cn], {});
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `CA ACL "${cn}" not found on ${context.globalArgs.server}: ${
                 e instanceof Error ? e.message : String(e)
               }`,
             ],
@@ -2326,6 +2624,559 @@ export const model = {
               if (idempotent && isNotFound(e)) {
                 context.logger.info(
                   "role_del: {cn} already absent, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    privilegeShow: {
+      description:
+        "Snapshot a single privilege by name, including its bundled permissions (read-only).",
+      arguments: z.object({
+        cn: z.string().describe("Privilege name (cn) to fetch"),
+      }),
+      execute: async (
+        args: { cn: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Showing privilege {cn}", { cn: args.cn });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("privilege_show", [args.cn], {
+          all: true,
+        });
+        const privilege = parsePrivilege(
+          (res.result ?? {}) as Record<string, unknown>,
+        );
+        context.logger.info("Retrieved privilege {cn}", { cn: args.cn });
+
+        const handle = await context.writeResource("privilege", "privilege", {
+          server: cfg.server,
+          privilege,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    ensurePrivilege: {
+      description:
+        "Idempotently ensure a privilege exists (privilege_add). Swallows DuplicateEntry and re-reads via privilege_show, so re-runs are safe. Writes the privilege state on success; audits both paths. NOTE: privilege mutation is privilege-escalation sensitive and admin/break-glass scoped — the scoped service account is deliberately NOT granted Delegation Administrator, so this operates only within the rights the operator already holds.",
+      arguments: z.object({
+        cn: z.string().describe("Privilege name (cn)"),
+        description: z
+          .string()
+          .optional()
+          .describe("Free-text description (IPA `description`)"),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra raw IPA privilege_add options (lowercase IPA option names), merged last",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const options: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.options ?? {}),
+        };
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "privilege_add",
+          ["privilege_add", "privilege_show"],
+          { cn: args.cn, description: args.description ?? null },
+          async () => {
+            try {
+              return await client.call("privilege_add", [args.cn], options);
+            } catch (e) {
+              // Idempotent create: an existing privilege is a no-op success.
+              // Re-read the live entry so the recorded response and the
+              // `privilege` state reflect reality. Non-duplicate errors still
+              // propagate.
+              if (isDuplicateEntry(e)) {
+                context.logger.info(
+                  "privilege_add: {cn} already exists, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return await client.call("privilege_show", [args.cn], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
+        );
+
+        const privilege = parsePrivilege(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "privilege",
+          "privilege",
+          {
+            server: cfg.server,
+            privilege,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    privilegeAddPermission: {
+      description:
+        "Add permissions to a privilege in one call (privilege_add_permission). Fan-out: pass a list of permissions. Surfaces IPA's `completed`/`failed`/`result` structure in the audit response; writes the updated privilege state on success. NOTE: privilege mutation is privilege-escalation sensitive and admin/break-glass scoped — bounded by the operator's own rights (no Delegation Administrator on the scoped service account).",
+      arguments: z.object({
+        cn: z.string().describe("Privilege name (cn)"),
+        permissions: z
+          .array(z.string())
+          .describe("Permissions to add to the privilege (IPA `permission`)"),
+      }),
+      execute: async (
+        args: { cn: string; permissions: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "privilege_add_permission",
+          ["privilege_add_permission"],
+          { cn: args.cn, permissions: args.permissions },
+          async () => {
+            const res = await client.call(
+              "privilege_add_permission",
+              [args.cn],
+              { permission: args.permissions },
+            );
+            // `completed` count and `failed` structure are surfaced so a
+            // silent half-fail (e.g. already-member) is visible in the audit.
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const privilege = parsePrivilege(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource(
+          "privilege",
+          "privilege",
+          {
+            server: cfg.server,
+            privilege,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    privilegeDel: {
+      description:
+        "Delete a privilege (privilege_del). Requires confirm:true; audits both paths. NOTE: privilege deletion is privilege-escalation sensitive and admin/break-glass scoped by design (the scoped service account is deliberately NOT granted Delegation Administrator).",
+      arguments: z.object({
+        cn: z.string().describe("Privilege name (cn) to delete"),
+        confirm: z
+          .boolean()
+          .describe("Must be true; a guard against accidental deletion"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent privilege (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; confirm: boolean; idempotent?: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        if (args.confirm !== true) {
+          throw new Error(
+            `Refusing to delete privilege "${args.cn}": pass confirm:true to proceed`,
+          );
+        }
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+
+        const { handle } = await recordAttempt(
+          context,
+          args.cn,
+          "privilege_del",
+          ["privilege_del"],
+          { cn: args.cn, idempotent },
+          async () => {
+            try {
+              return await client.call("privilege_del", [args.cn], {});
+            } catch (e) {
+              // Idempotent delete: an already-gone privilege is a no-op
+              // success. Non-NotFound errors and the default (idempotent:false)
+              // path still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "privilege_del: {cn} already absent, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    caAclFind: {
+      description:
+        "Snapshot CA ACLs matching an optional search criteria (read-only).",
+      arguments: z.object({
+        criteria: z
+          .string()
+          .optional()
+          .describe("Free-text search; omit to list all CA ACLs"),
+      }),
+      execute: async (
+        args: { criteria?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Finding CA ACLs matching {criteria}", {
+          criteria: args.criteria ?? "(all)",
+        });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("caacl_find", [args.criteria ?? ""], {
+          all: true,
+        });
+        const caAcls = ((res.result ?? []) as Array<Record<string, unknown>>)
+          .map(parseCaAcl);
+        context.logger.info("Found {count} CA ACLs", { count: caAcls.length });
+
+        const handle = await context.writeResource("caAcls", "caAcls", {
+          server: cfg.server,
+          caAcls,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    caAclShow: {
+      description: "Snapshot a single CA ACL by name (read-only).",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn) to fetch"),
+      }),
+      execute: async (
+        args: { cn: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Showing CA ACL {cn}", { cn: args.cn });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("caacl_show", [args.cn], {
+          all: true,
+        });
+        const caAcl = parseCaAcl(
+          (res.result ?? {}) as Record<string, unknown>,
+        );
+        context.logger.info("Retrieved CA ACL {cn}", { cn: args.cn });
+
+        const handle = await context.writeResource("caAcl", "caAcl", {
+          server: cfg.server,
+          caAcl,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    ensureCaAcl: {
+      description:
+        "Idempotently ensure a CA ACL exists (caacl_add). Swallows DuplicateEntry and re-reads via caacl_show, so re-runs are safe. Writes the CA ACL state on success; audits both paths. `userCategory:'all'` and the other attrs are applied on CREATE only — like ensureRole/ensureSudoRule, a pre-existing divergent ACL is re-read but NOT reconciled on the duplicate path. NOTE: CA-ACL mutation is privilege-escalation sensitive and admin/break-glass scoped — a CA ACL governs who may obtain certificates; the scoped service account is deliberately NOT granted Delegation Administrator.",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn)"),
+        description: z
+          .string()
+          .optional()
+          .describe("Free-text description (IPA `description`)"),
+        userCategory: z
+          .enum(["all"])
+          .optional()
+          .describe(
+            "User category (IPA `usercategory`); `all` == the ACL applies to all users. Set this when the ACL is user-category-wide; otherwise attach explicit users via caAclAddUser. Applied on create only.",
+          ),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra raw IPA caacl_add options (lowercase IPA option names) — an escape hatch, merged last so it takes precedence on conflict",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          userCategory?: "all";
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const options: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.userCategory ? { usercategory: args.userCategory } : {}),
+          ...(args.options ?? {}),
+        };
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "caacl_add",
+          ["caacl_add", "caacl_show"],
+          { cn: args.cn, description: args.description ?? null },
+          async () => {
+            try {
+              return await client.call("caacl_add", [args.cn], options);
+            } catch (e) {
+              // Idempotent create: an existing ACL is a no-op success. Re-read
+              // the live entry so the recorded response and the `caAcl` state
+              // reflect reality. Non-duplicate errors still propagate.
+              if (isDuplicateEntry(e)) {
+                context.logger.info(
+                  "caacl_add: {cn} already exists, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return await client.call("caacl_show", [args.cn], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
+        );
+
+        const caAcl = parseCaAcl(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("caAcl", "caAcl", {
+          server: cfg.server,
+          caAcl,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    caAclAddCertprofile: {
+      description:
+        "Add certificate profiles to a CA ACL in one call (caacl_add_profile; the IPA CLI is `caacl-add-profile --certprofiles=`). Fan-out: pass a list of certprofiles (IPA option `certprofile`). Surfaces IPA's `completed`/`failed`/`result` structure in the audit response; writes the updated CA ACL state on success. NOTE: CA-ACL mutation is privilege-escalation sensitive and admin/break-glass scoped (no Delegation Administrator on the scoped service account).",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn)"),
+        certprofiles: z
+          .array(z.string())
+          .describe(
+            "Certificate profiles to add (IPA `certprofile`), e.g. caIPAserviceCert",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; certprofiles: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "caacl_add_profile",
+          ["caacl_add_profile"],
+          { cn: args.cn, certprofiles: args.certprofiles },
+          async () => {
+            const res = await client.call(
+              "caacl_add_profile",
+              [args.cn],
+              { certprofile: args.certprofiles },
+            );
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const caAcl = parseCaAcl(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("caAcl", "caAcl", {
+          server: cfg.server,
+          caAcl,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    caAclAddUser: {
+      description:
+        "Add users and/or user groups to a CA ACL in one call (caacl_add_user). Fan-out: pass lists of users and groups (IPA options `user`/`group`). Surfaces IPA's `completed`/`failed`/`result` structure in the audit response; writes the updated CA ACL state on success. NOTE: CA-ACL mutation is privilege-escalation sensitive and admin/break-glass scoped (no Delegation Administrator on the scoped service account).",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn)"),
+        users: z
+          .array(z.string())
+          .optional()
+          .describe("User logins to add (IPA `user`)"),
+        groups: z
+          .array(z.string())
+          .optional()
+          .describe("User groups to add (IPA `group`)"),
+      }),
+      execute: async (
+        args: { cn: string; users?: string[]; groups?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "caacl_add_user",
+          ["caacl_add_user"],
+          { cn: args.cn, users: args.users ?? [], groups: args.groups ?? [] },
+          async () => {
+            const res = await client.call("caacl_add_user", [args.cn], {
+              user: args.users ?? [],
+              group: args.groups ?? [],
+            });
+            return {
+              completed: res.completed ?? null,
+              failed: res.failed ?? null,
+              result: res.result ?? null,
+            };
+          },
+        );
+
+        const caAcl = parseCaAcl(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("caAcl", "caAcl", {
+          server: cfg.server,
+          caAcl,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    caAclSetEnabled: {
+      description:
+        "Enable or disable a CA ACL (caacl_enable / caacl_disable). Writes the updated CA ACL state on success; audits both paths. NOTE: CA-ACL mutation is privilege-escalation sensitive and admin/break-glass scoped (no Delegation Administrator on the scoped service account).",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn)"),
+        enabled: z
+          .boolean()
+          .describe("true -> caacl_enable, false -> caacl_disable"),
+      }),
+      execute: async (
+        args: { cn: string; enabled: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const command = args.enabled ? "caacl_enable" : "caacl_disable";
+
+        const { handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          command,
+          [command],
+          { cn: args.cn, enabled: args.enabled },
+          () => client.call(command, [args.cn], {}),
+        );
+
+        // State resource, success-only: re-read the ACL so the snapshot
+        // reflects the new enabled state (enable/disable return a boolean, not
+        // the entry itself).
+        const showRes = await client.call("caacl_show", [args.cn], {
+          all: true,
+        });
+        const caAcl = parseCaAcl(
+          (showRes.result ?? {}) as Record<string, unknown>,
+        );
+        const stateHandle = await context.writeResource("caAcl", "caAcl", {
+          server: cfg.server,
+          caAcl,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, stateHandle] };
+      },
+    },
+    caAclDel: {
+      description:
+        "Delete a CA ACL (caacl_del). Requires confirm:true; audits both paths. NOTE: CA-ACL deletion is privilege-escalation sensitive and admin/break-glass scoped by design (the scoped service account is deliberately NOT granted Delegation Administrator).",
+      arguments: z.object({
+        cn: z.string().describe("CA ACL name (cn) to delete"),
+        confirm: z
+          .boolean()
+          .describe("Must be true; a guard against accidental deletion"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent CA ACL (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; confirm: boolean; idempotent?: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        if (args.confirm !== true) {
+          throw new Error(
+            `Refusing to delete CA ACL "${args.cn}": pass confirm:true to proceed`,
+          );
+        }
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+
+        const { handle } = await recordAttempt(
+          context,
+          args.cn,
+          "caacl_del",
+          ["caacl_del"],
+          { cn: args.cn, idempotent },
+          async () => {
+            try {
+              return await client.call("caacl_del", [args.cn], {});
+            } catch (e) {
+              // Idempotent delete: an already-gone ACL is a no-op success.
+              // Non-NotFound errors and the default (idempotent:false) path
+              // still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "caacl_del: {cn} already absent, treating as no-op (idempotent)",
                   { cn: args.cn },
                 );
                 return { result: true, alreadyAbsent: true };

@@ -19,11 +19,15 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   buildRpcBody,
+  caaclStr,
+  caaclStrArray,
   isDuplicateEntry,
   isNotFound,
   model,
   one,
+  parseCaAcl,
   parseHbacRule,
+  parsePrivilege,
   parseRole,
   parseSudoRule,
   toBool,
@@ -1242,6 +1246,706 @@ Deno.test("roleDel idempotent: NotFound records success, no state", async () => 
     assertEquals(writes[0].data.success, true);
     assertEquals(
       (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Privilege surface (privilege_add / _add_permission / _del / _show).
+// ---------------------------------------------------------------------------
+
+/** A minimal parsed IPA privilege entry for result payloads. */
+const certIssuanceEntry = {
+  cn: ["cert-issuers"],
+  description: ["Issue user certs within a CA ACL"],
+  member_permission: ["Request Certificate", "Revoke Certificate"],
+};
+
+Deno.test("parsePrivilege() flattens a privilege entry and keeps raw", () => {
+  const parsed = parsePrivilege(certIssuanceEntry);
+  assertEquals(parsed.cn, "cert-issuers");
+  assertEquals(parsed.description, "Issue user certs within a CA ACL");
+  assertEquals(parsed.permissions, [
+    "Request Certificate",
+    "Revoke Certificate",
+  ]);
+  assertEquals(parsed.raw, certIssuanceEntry);
+});
+
+Deno.test("parsePrivilege() merges member_permission and memberof_permission, deduped", () => {
+  const parsed = parsePrivilege({
+    cn: ["p"],
+    member_permission: ["A", "B"],
+    memberof_permission: ["B", "C"],
+  });
+  assertEquals(parsed.permissions, ["A", "B", "C"]);
+});
+
+Deno.test("privilegeShow: snapshots a single privilege into a `privilege` resource", async () => {
+  const mock = installFetch({
+    privilege_show: ok({ result: certIssuanceEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeShow.execute(
+      { cn: "cert-issuers" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["privilege_show"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "privilege");
+    assertEquals(
+      (writes[0].data.privilege as { permissions: string[] }).permissions,
+      ["Request Certificate", "Revoke Certificate"],
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensurePrivilege: writes attempt(success) then privilege state, in order", async () => {
+  const mock = installFetch({
+    privilege_add: ok({ result: certIssuanceEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensurePrivilege.execute(
+      { cn: "cert-issuers", description: "Issue user certs" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["privilege_add"]);
+    const addCall = mock.jsonCalls[0];
+    assertEquals(
+      (addCall.params as [string[], Record<string, unknown>])[1].description,
+      "Issue user certs",
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt", "privilege"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(writes[0].data.error, null);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensurePrivilege idempotent: DuplicateEntry re-reads and records success", async () => {
+  const mock = installFetch({
+    privilege_add: err(
+      "DuplicateEntry",
+      "privilege cert-issuers exists",
+      4002,
+    ),
+    privilege_show: ok({ result: certIssuanceEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensurePrivilege.execute(
+      { cn: "cert-issuers" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "privilege_add",
+      "privilege_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "privilege"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[1].data.privilege as { cn: string }).cn,
+      "cert-issuers",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeAddPermission: fan-out permissions reach the call and surface completed/failed", async () => {
+  const perms = [
+    "Request Certificate",
+    "Retrieve Certificates from the CA",
+    "Get Certificates status from the CA",
+    "Revoke Certificate",
+  ];
+  const withPerms = { ...certIssuanceEntry, member_permission: perms };
+  const mock = installFetch({
+    privilege_add_permission: ok({
+      completed: 4,
+      failed: {},
+      result: withPerms,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeAddPermission.execute(
+      { cn: "cert-issuers", permissions: perms },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "privilege_add_permission",
+    ]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.permission, perms);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "privilege"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      4,
+    );
+    assertEquals(
+      (writes[1].data.privilege as { permissions: string[] }).permissions,
+      perms,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeAddPermission: already-member failed structure surfaced, no throw", async () => {
+  // IPA idempotent re-add: completed:0 with a `failed` payload, no top-level
+  // error — the method must NOT throw and must record the honest audit.
+  const mock = installFetch({
+    privilege_add_permission: ok({
+      completed: 0,
+      failed: {
+        member: {
+          permission: [[
+            "Request Certificate",
+            "This entry is already a member",
+          ]],
+        },
+      },
+      result: certIssuanceEntry,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeAddPermission.execute(
+      { cn: "cert-issuers", permissions: ["Request Certificate"] },
+      context,
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt", "privilege"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      0,
+    );
+    assertEquals(
+      (writes[0].data.response as { failed: unknown }).failed != null,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeDel: confirm:false throws before any transport or write", async () => {
+  const mock = installFetch({});
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.privilegeDel.execute(
+          { cn: "cert-issuers", confirm: false },
+          context,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+    assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeDel: confirm:true audits the delete, writes no state", async () => {
+  const mock = installFetch({
+    privilege_del: ok({
+      result: true,
+      value: ["cert-issuers"],
+      summary: "Deleted privilege cert-issuers",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeDel.execute(
+      { cn: "cert-issuers", confirm: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["privilege_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeDel idempotent: NotFound records success, no state", async () => {
+  const mock = installFetch({
+    privilege_del: err("NotFound", "privilege gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.privilegeDel.execute(
+      { cn: "gone", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["privilege_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("privilegeDel non-idempotent: NotFound still fails (default preserved)", async () => {
+  const mock = installFetch({
+    privilege_del: err("NotFound", "privilege gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.privilegeDel.execute(
+          { cn: "gone", confirm: true },
+          context,
+        ),
+      Error,
+      "NotFound",
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CA ACL surface (caacl_add / _find / _show / _add_certprofile / _add_user /
+// _enable / _disable / _del).
+// ---------------------------------------------------------------------------
+
+/** A minimal parsed IPA CA ACL entry for result payloads. */
+const userCertsEntry = {
+  cn: ["user-cert-acl"],
+  ipaenabledflag: ["TRUE"],
+  usercategory: ["all"],
+  ipamembercertprofile_certprofile: ["caIPAserviceCert"],
+};
+
+Deno.test("parseCaAcl() flattens a CA ACL entry and keeps raw", () => {
+  const parsed = parseCaAcl(userCertsEntry);
+  assertEquals(parsed.cn, "user-cert-acl");
+  assertEquals(parsed.enabled, true);
+  assertEquals(parsed.userCategory, "all");
+  assertEquals(parsed.certprofiles, ["caIPAserviceCert"]);
+  assertEquals(parsed.users, []);
+  assertEquals(parsed.raw, userCertsEntry);
+});
+
+Deno.test("parseCaAcl() merges ipamembercertprofile and member_certprofile, deduped", () => {
+  const parsed = parseCaAcl({
+    cn: ["c"],
+    ipamembercertprofile_certprofile: ["caIPAserviceCert"],
+    member_certprofile: ["caIPAserviceCert", "otherProfile"],
+    memberuser_user: ["alice", "jdoe"],
+  });
+  assertEquals(parsed.certprofiles, ["caIPAserviceCert", "otherProfile"]);
+  assertEquals(parsed.users, ["alice", "jdoe"]);
+});
+
+Deno.test("caaclStr()/caaclStrArray() unwrap the __dns_name__ object wire form", () => {
+  assertEquals(
+    caaclStr([{ __dns_name__: "host.example.com." }]),
+    "host.example.com.",
+  );
+  assertEquals(caaclStr("plain"), "plain");
+  assertEquals(caaclStr(undefined), "");
+  assertEquals(
+    caaclStrArray([{ __dns_name__: "a.example.com." }, "b"]),
+    ["a.example.com.", "b"],
+  );
+  assertEquals(caaclStrArray(undefined), []);
+});
+
+Deno.test("caAclFind: snapshots matched ACLs into a `caAcls` resource", async () => {
+  const mock = installFetch({
+    caacl_find: ok({
+      result: [userCertsEntry],
+      count: 1,
+      summary: "1 CA ACL matched",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclFind.execute({ criteria: "user" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_find"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "caAcls");
+    assertEquals((writes[0].data.caAcls as unknown[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclShow: snapshots a single ACL into a `caAcl` resource", async () => {
+  const mock = installFetch({ caacl_show: ok({ result: userCertsEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclShow.execute({ cn: "user-cert-acl" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_show"]);
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "caAcl");
+    assertEquals(
+      (writes[0].data.caAcl as { cn: string }).cn,
+      "user-cert-acl",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureCaAcl: writes attempt(success) then ACL state; raw options reach IPA", async () => {
+  const mock = installFetch({ caacl_add: ok({ result: userCertsEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureCaAcl.execute(
+      { cn: "user-cert-acl", options: { usercategory: "all" } },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_add"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.usercategory, "all");
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureCaAcl: first-class userCategory arg reaches caacl_add as usercategory", async () => {
+  // A fresh (non-duplicate) create with the first-class `userCategory:"all"`
+  // arg must map to the IPA `usercategory` option on the wire.
+  const mock = installFetch({ caacl_add: ok({ result: userCertsEntry }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureCaAcl.execute(
+      { cn: "user-cert-acl", userCategory: "all" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_add"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.usercategory, "all");
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureCaAcl idempotent: DuplicateEntry re-reads and records success", async () => {
+  const mock = installFetch({
+    caacl_add: err("DuplicateEntry", "CA ACL user-cert-acl exists", 4002),
+    caacl_show: ok({ result: userCertsEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.ensureCaAcl.execute(
+      { cn: "user-cert-acl" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "caacl_add",
+      "caacl_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[1].data.caAcl as { cn: string }).cn,
+      "user-cert-acl",
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclAddCertprofile: fan-out certprofiles reach the call under `certprofile`", async () => {
+  const withProfile = {
+    ...userCertsEntry,
+    ipamembercertprofile_certprofile: ["caIPAserviceCert"],
+  };
+  const mock = installFetch({
+    caacl_add_profile: ok({
+      completed: 1,
+      failed: {},
+      result: withProfile,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclAddCertprofile.execute(
+      { cn: "user-cert-acl", certprofiles: ["caIPAserviceCert"] },
+      context,
+    );
+    // Regression guard: the real IPA member command is `caacl_add_profile`
+    // (the CLI is `caacl-add-profile`), NOT `caacl_add_certprofile` — live IPA
+    // rejects the latter with error 905 "unknown command". Assert the exact
+    // JSON-RPC method name so a rename regression is caught in-suite.
+    assertEquals(mock.jsonCalls[0].command, "caacl_add_profile");
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "caacl_add_profile",
+    ]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.certprofile, ["caIPAserviceCert"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      1,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclAddUser: fan-out users + groups reach the call under `user`/`group`", async () => {
+  const withUsers = {
+    ...userCertsEntry,
+    memberuser_user: ["alice", "jdoe"],
+    memberuser_group: ["cert-users"],
+  };
+  const mock = installFetch({
+    caacl_add_user: ok({ completed: 3, failed: {}, result: withUsers }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclAddUser.execute(
+      {
+        cn: "user-cert-acl",
+        users: ["alice", "jdoe"],
+        groups: ["cert-users"],
+      },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_add_user"]);
+    const opts =
+      (mock.jsonCalls[0].params as [string[], Record<string, unknown>])[1];
+    assertEquals(opts.user, ["alice", "jdoe"]);
+    assertEquals(opts.group, ["cert-users"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclSetEnabled enable: calls caacl_enable then re-reads state", async () => {
+  const mock = installFetch({
+    caacl_enable: ok({ result: true, value: ["user-cert-acl"] }),
+    caacl_show: ok({ result: userCertsEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclSetEnabled.execute(
+      { cn: "user-cert-acl", enabled: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "caacl_enable",
+      "caacl_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals((writes[1].data.caAcl as { enabled: boolean }).enabled, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclSetEnabled disable: calls caacl_disable then re-reads state", async () => {
+  const disabledEntry = { ...userCertsEntry, ipaenabledflag: ["FALSE"] };
+  const mock = installFetch({
+    caacl_disable: ok({ result: true, value: ["user-cert-acl"] }),
+    caacl_show: ok({ result: disabledEntry }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclSetEnabled.execute(
+      { cn: "user-cert-acl", enabled: false },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "caacl_disable",
+      "caacl_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals((writes[1].data.caAcl as { enabled: boolean }).enabled, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclDel: confirm:false throws before any transport or write", async () => {
+  const mock = installFetch({});
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.caAclDel.execute(
+          { cn: "user-cert-acl", confirm: false },
+          context,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+    assertEquals(writes.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclDel: confirm:true audits the delete, writes no state", async () => {
+  const mock = installFetch({
+    caacl_del: ok({
+      result: true,
+      value: ["user-cert-acl"],
+      summary: "Deleted CA ACL user-cert-acl",
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclDel.execute(
+      { cn: "user-cert-acl", confirm: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclDel idempotent: NotFound records success, no state", async () => {
+  const mock = installFetch({
+    caacl_del: err("NotFound", "CA ACL gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclDel.execute(
+      { cn: "gone", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["caacl_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { alreadyAbsent?: boolean }).alreadyAbsent,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclDel non-idempotent: NotFound still fails (default preserved)", async () => {
+  const mock = installFetch({
+    caacl_del: err("NotFound", "CA ACL gone not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(
+      () =>
+        model.methods.caAclDel.execute(
+          { cn: "gone", confirm: true },
+          context,
+        ),
+      Error,
+      "NotFound",
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclAddCertprofile: already-member failed structure surfaced, no throw", async () => {
+  // IPA idempotent re-add: completed:0 with a `failed` payload, no top-level
+  // error — the method must NOT throw and must record the honest audit.
+  const mock = installFetch({
+    caacl_add_profile: ok({
+      completed: 0,
+      failed: {
+        ipamembercertprofile: {
+          certprofile: [[
+            "caIPAserviceCert",
+            "This entry is already a member",
+          ]],
+        },
+      },
+      result: userCertsEntry,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclAddCertprofile.execute(
+      { cn: "user-cert-acl", certprofiles: ["caIPAserviceCert"] },
+      context,
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      0,
+    );
+    assertEquals(
+      (writes[0].data.response as { failed: unknown }).failed != null,
+      true,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("caAclAddUser: already-member failed structure surfaced, no throw", async () => {
+  // IPA idempotent re-add: completed:0 with a `failed` payload, no top-level
+  // error — the method must NOT throw and must record the honest audit.
+  const mock = installFetch({
+    caacl_add_user: ok({
+      completed: 0,
+      failed: {
+        memberuser: {
+          user: [["alice", "This entry is already a member"]],
+        },
+      },
+      result: userCertsEntry,
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.caAclAddUser.execute(
+      { cn: "user-cert-acl", users: ["alice"] },
+      context,
+    );
+    assertEquals(writes.map((w) => w.spec), ["attempt", "caAcl"]);
+    assertEquals(writes[0].data.success, true);
+    assertEquals(
+      (writes[0].data.response as { completed: unknown }).completed,
+      0,
+    );
+    assertEquals(
+      (writes[0].data.response as { failed: unknown }).failed != null,
       true,
     );
   } finally {
