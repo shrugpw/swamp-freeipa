@@ -110,6 +110,17 @@ const GroupsSchema = z.object({
 });
 
 /**
+ * Snapshot of a single user group (parsed row + raw entry) — the `group` state
+ * resource written by the generic `groupShow`/`groupAdd`/`groupMod`/`groupSync`
+ * methods. The mirror of the user model's `user` resource.
+ */
+const GroupSchema = z.object({
+  server: z.string(),
+  group: GroupRowSchema,
+  retrievedAt: z.iso.datetime(),
+});
+
+/**
  * State of a `radius-vlan-<id>` group pair after {@link vlanGroupCn} ensure.
  *
  * Written on success (`complete: true`) and also on a partial failure
@@ -527,17 +538,83 @@ export function isDuplicateEntry(e: unknown): boolean {
   return false;
 }
 
+/**
+ * Predicate: is this error IPA's "no such entry" (`NotFound`, code 4001)? The
+ * mirror of {@link isDuplicateEntry} — used to make `groupDel` idempotent (a
+ * missing target is already gone, which is success for an idempotent delete)
+ * and to let `groupSync` detect an absent group and create it.
+ *
+ * Accepts the raw IPA error object, an `Error` whose message was formatted by
+ * {@link ipaLogin} (`... NotFound: ... (code 4001)`), or a bare string. Copied
+ * verbatim from the family's `user` package (extensions publish independently
+ * and cannot cross-import); keep the two in sync.
+ *
+ * @param e The caught error (any shape).
+ * @returns `true` when it represents a not-found condition.
+ */
+export function isNotFound(e: unknown): boolean {
+  const matches = (s: string) => /NotFound/i.test(s) || /\bcode 4001\b/.test(s);
+  if (e && typeof e === "object") {
+    const obj = e as { name?: unknown; code?: unknown; message?: unknown };
+    if (obj.name === "NotFound") return true;
+    if (obj.code === 4001) return true;
+    if (typeof obj.message === "string" && matches(obj.message)) return true;
+    return false;
+  }
+  if (typeof e === "string") return matches(e);
+  return false;
+}
+
+/**
+ * Compare a desired attribute value against a raw IPA attribute value for the
+ * `groupSync` reconcile diff. IPA stores attributes as (often single-element)
+ * arrays; a desired value may be a scalar or an array. Both sides are
+ * normalized to sorted string arrays and compared set-wise, so multi-valued
+ * attributes are order-insensitive and `"x"` equals `["x"]`. Copied verbatim
+ * from the family's `user` package; keep the two in sync.
+ *
+ * @param actualRaw The raw IPA value (from a parsed group's `raw` entry).
+ * @param desired The desired value (scalar or array).
+ * @returns `true` when the two represent the same attribute set.
+ */
+export function attrEquals(actualRaw: unknown, desired: unknown): boolean {
+  const a = toStrArray(actualRaw).slice().sort();
+  const d = toStrArray(desired).slice().sort();
+  return a.length === d.length && a.every((x, i) => x === d[i]);
+}
+
+/** Minimal check context this model's pre-flight checks rely on. */
+interface CheckContext {
+  globalArgs: GlobalArgs;
+  modelType: string;
+  modelId: string;
+  dataRepository: {
+    getContent: (
+      type: string,
+      modelId: string,
+      dataName: string,
+      version?: number,
+    ) => Promise<Uint8Array | null>;
+  };
+}
+
 /** FreeIPA group management model definition. */
 export const model = {
   type: "@shrug/freeipa/group",
-  version: "2026.07.11.1",
+  version: "2026.07.16.1",
   description:
-    "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable.",
+    "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, generic user-group CRUD (groupShow/groupAdd/groupMod/groupDel) plus a desired-state groupSync reconcile, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable, with a confirm-guarded delete.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "groups": {
       description: "User-group + host-group inventory snapshot",
       schema: GroupsSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "group": {
+      description: "Snapshot of a single user group (parsed row + raw entry)",
+      schema: GroupSchema,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -554,6 +631,52 @@ export const model = {
       schema: AttemptSchema,
       lifetime: "infinite",
       garbageCollection: 50,
+    },
+  },
+  checks: {
+    "group-exists": {
+      description:
+        "Verify the most recently snapshotted user group still exists before a destructive delete.",
+      labels: ["live"],
+      appliesTo: ["groupDel"],
+      execute: async (
+        context: CheckContext,
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        // Pre-flight checks cannot see the method's arguments, so this verifies
+        // against the last `group` snapshot this model recorded. The method's
+        // own confirm:true guard and IPA's NotFound error remain the per-cn
+        // safeguards; this catches a stale-target delete against a live server.
+        const bytes = await context.dataRepository.getContent(
+          context.modelType,
+          context.modelId,
+          "group",
+        );
+        if (!bytes) return { pass: true };
+        let cn = "";
+        try {
+          const snap = JSON.parse(new TextDecoder().decode(bytes)) as {
+            group?: { cn?: string };
+          };
+          cn = snap.group?.cn ?? "";
+        } catch {
+          return { pass: true };
+        }
+        if (!cn) return { pass: true };
+        const client = await ipaLogin(context.globalArgs);
+        try {
+          await client.call("group_show", [cn], {});
+          return { pass: true };
+        } catch (e) {
+          return {
+            pass: false,
+            errors: [
+              `group "${cn}" not found on ${context.globalArgs.server}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ],
+          };
+        }
+      },
     },
   },
   methods: {
@@ -598,6 +721,344 @@ export const model = {
           retrievedAt: new Date().toISOString(),
         });
         return { dataHandles: [handle] };
+      },
+    },
+    groupShow: {
+      description:
+        "Snapshot a single user group by cn (group_show, read-only).",
+      arguments: z.object({
+        cn: z.string().describe("User-group common name to fetch"),
+      }),
+      execute: async (
+        args: { cn: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        context.logger.info("Showing group {cn}", { cn: args.cn });
+        const client = await ipaLogin(cfg);
+        const res = await client.call("group_show", [args.cn], { all: true });
+        const group = parseGroupRow(
+          (res.result ?? {}) as Record<string, unknown>,
+        );
+        const handle = await context.writeResource("group", "group", {
+          server: cfg.server,
+          group,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    groupAdd: {
+      description:
+        "Create a user group (group_add). Writes the created group state on success; audits both paths. Optional idempotent flag treats an existing group as a no-op.",
+      arguments: z.object({
+        cn: z.string().describe("User-group common name"),
+        description: z
+          .string()
+          .optional()
+          .describe("Group description (IPA `description`)"),
+        gid: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Explicit POSIX GID (IPA `gidnumber`); omit to let IPA auto-assign",
+          ),
+        nonposix: z
+          .boolean()
+          .optional()
+          .describe(
+            "Create a non-POSIX group (IPA `nonposix`); omit for a normal POSIX group",
+          ),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-existing group (IPA DuplicateEntry) is treated as success: the live entry is re-read and recorded as a no-op instead of failing. Default false preserves fail-on-duplicate.",
+          ),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra raw IPA group_add options (lowercase IPA option names), merged last",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          gid?: number;
+          nonposix?: boolean;
+          idempotent?: boolean;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+        const options: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.gid !== undefined ? { gidnumber: args.gid } : {}),
+          ...(args.nonposix !== undefined ? { nonposix: args.nonposix } : {}),
+          ...(args.options ?? {}),
+        };
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "group_add",
+          idempotent ? ["group_add", "group_show"] : ["group_add"],
+          {
+            cn: args.cn,
+            description: args.description ?? null,
+            gid: args.gid ?? null,
+            nonposix: args.nonposix ?? null,
+            idempotent,
+          },
+          async () => {
+            try {
+              return await client.call("group_add", [args.cn], options);
+            } catch (e) {
+              // Idempotent create: an existing group is a no-op success. Re-read
+              // the live entry so the recorded response and the `group` state
+              // reflect reality. Non-duplicate errors and the default
+              // (idempotent:false) path still propagate.
+              if (idempotent && isDuplicateEntry(e)) {
+                context.logger.info(
+                  "group_add: {cn} already exists, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return await client.call("group_show", [args.cn], {
+                  all: true,
+                });
+              }
+              throw e;
+            }
+          },
+        );
+
+        const group = parseGroupRow(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const groupHandle = await context.writeResource("group", "group", {
+          server: cfg.server,
+          group,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, groupHandle] };
+      },
+    },
+    groupMod: {
+      description:
+        "Modify a user group (group_mod). Writes the updated group state on success; audits both paths.",
+      arguments: z.object({
+        cn: z.string().describe("User-group common name to modify"),
+        set: z
+          .record(z.string(), z.unknown())
+          .describe(
+            'Fields to change as IPA options (lowercase IPA option names, e.g. { description: "swamp runtime service group", gidnumber: 12000 })',
+          ),
+      }),
+      execute: async (
+        args: { cn: string; set: Record<string, unknown> },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "group_mod",
+          ["group_mod"],
+          { cn: args.cn, set: args.set },
+          () => client.call("group_mod", [args.cn], args.set),
+        );
+
+        const group = parseGroupRow(
+          (result.result ?? {}) as Record<string, unknown>,
+        );
+        const groupHandle = await context.writeResource("group", "group", {
+          server: cfg.server,
+          group,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, groupHandle] };
+      },
+    },
+    groupDel: {
+      description:
+        "Delete a user group (group_del). Requires confirm:true; audits both paths. Optional idempotent flag treats an already-absent group as success.",
+      arguments: z.object({
+        cn: z.string().describe("User-group common name to delete"),
+        confirm: z
+          .boolean()
+          .describe("Must be true; a guard against accidental deletion"),
+        idempotent: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "When true, an already-absent group (IPA NotFound) is treated as success instead of failing. Default false preserves fail-on-missing. The confirm guard always applies.",
+          ),
+      }),
+      execute: async (
+        args: { cn: string; confirm: boolean; idempotent?: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        if (args.confirm !== true) {
+          throw new Error(
+            `Refusing to delete group "${args.cn}": pass confirm:true to proceed`,
+          );
+        }
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        const idempotent = args.idempotent ?? false;
+
+        const { handle } = await recordAttempt(
+          context,
+          args.cn,
+          "group_del",
+          ["group_del"],
+          { cn: args.cn, idempotent },
+          async () => {
+            try {
+              return await client.call("group_del", [args.cn], {});
+            } catch (e) {
+              // Idempotent delete: an already-gone group is a no-op success.
+              // Non-NotFound errors and the default (idempotent:false) path
+              // still propagate so a real failure is never masked.
+              if (idempotent && isNotFound(e)) {
+                context.logger.info(
+                  "group_del: {cn} already absent, treating as no-op (idempotent)",
+                  { cn: args.cn },
+                );
+                return { result: true, alreadyAbsent: true };
+              }
+              throw e;
+            }
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    groupSync: {
+      description:
+        "Reconcile a user group to a desired spec: create it if absent (group_add), otherwise group_mod only the drifted attributes (description/gid + extra options). Idempotent — a converged group issues no IPA writes. Membership is out of scope (see groupAddMember/groupRemoveMember). Writes the converged group state on success; audits both paths, and the audit response lists the `changes` made.",
+      arguments: z.object({
+        cn: z.string().describe("User-group common name to reconcile"),
+        description: z
+          .string()
+          .optional()
+          .describe(
+            "Desired description (IPA `description`); omit to leave it unmanaged",
+          ),
+        gid: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Desired POSIX GID (IPA `gidnumber`); omit to leave it unmanaged (IPA auto-assigns on create)",
+          ),
+        options: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Extra desired IPA attributes to reconcile (lowercase IPA option names), diffed and group_mod'd like the built-in fields",
+          ),
+      }),
+      execute: async (
+        args: {
+          cn: string;
+          description?: string;
+          gid?: number;
+          options?: Record<string, unknown>;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const client = await ipaLogin(cfg);
+        context.logger.info("Reconciling group {cn}", { cn: args.cn });
+
+        // 1. Read actual state (the group may not exist yet).
+        let actual: GroupRow | null = null;
+        try {
+          const showRes = await client.call("group_show", [args.cn], {
+            all: true,
+          });
+          actual = parseGroupRow(
+            (showRes.result ?? {}) as Record<string, unknown>,
+          );
+        } catch (e) {
+          if (!isNotFound(e)) throw e;
+          context.logger.info("group {cn} absent — will create", {
+            cn: args.cn,
+          });
+        }
+
+        // The desired managed attribute set, in IPA option form.
+        const desiredAttrs: Record<string, unknown> = {
+          ...(args.description !== undefined
+            ? { description: args.description }
+            : {}),
+          ...(args.gid !== undefined ? { gidnumber: args.gid } : {}),
+          ...(args.options ?? {}),
+        };
+
+        const changes: string[] = [];
+        const { result, handle: attemptHandle } = await recordAttempt(
+          context,
+          args.cn,
+          "groupSync",
+          ["group_show", "group_add", "group_mod"],
+          { cn: args.cn, desired: desiredAttrs },
+          async () => {
+            if (actual === null) {
+              // 2a. Absent -> create with the full desired spec.
+              await client.call("group_add", [args.cn], desiredAttrs);
+              changes.push("created");
+            } else {
+              // 2b. Present -> group_mod only the attributes that drifted.
+              const set: Record<string, unknown> = {};
+              for (const [k, v] of Object.entries(desiredAttrs)) {
+                if (!attrEquals(actual.raw[k], v)) set[k] = v;
+              }
+              if (Object.keys(set).length > 0) {
+                await client.call("group_mod", [args.cn], set);
+                changes.push(...Object.keys(set).map((k) => `mod:${k}`));
+              }
+            }
+            return {
+              cn: args.cn,
+              created: actual === null,
+              changes,
+              converged: changes.length === 0,
+            };
+          },
+        );
+
+        // State resource, success-only: re-read so the snapshot is the
+        // converged group regardless of which branch ran.
+        context.logger.info("group {cn} reconciled: {changes}", {
+          cn: args.cn,
+          changes: (result as { changes: string[] }).changes,
+        });
+        const finalRes = await client.call("group_show", [args.cn], {
+          all: true,
+        });
+        const group = parseGroupRow(
+          (finalRes.result ?? {}) as Record<string, unknown>,
+        );
+        const groupHandle = await context.writeResource("group", "group", {
+          server: cfg.server,
+          group,
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [attemptHandle, groupHandle] };
       },
     },
     ensureVlanGroup: {

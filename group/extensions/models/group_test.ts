@@ -18,8 +18,10 @@
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
+  attrEquals,
   buildRpcBody,
   isDuplicateEntry,
+  isNotFound,
   model,
   one,
   parseGroupRow,
@@ -375,6 +377,222 @@ Deno.test("groupRemoveMember: host kind maps to hostgroup_remove_member", async 
     ]);
     assertEquals(writes.map((w) => w.spec), ["attempt"]);
     assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Generic user-group CRUD + sync (groupShow/groupAdd/groupMod/groupDel/groupSync)
+// ---------------------------------------------------------------------------
+
+Deno.test("isNotFound() detects NotFound / code 4001", () => {
+  assertEquals(isNotFound({ name: "NotFound" }), true);
+  assertEquals(isNotFound({ code: 4001 }), true);
+  assertEquals(
+    isNotFound(new Error("IPA group_show failed: NotFound: x (code 4001)")),
+    true,
+  );
+  assertEquals(isNotFound({ name: "DuplicateEntry", code: 4002 }), false);
+  assertEquals(isNotFound("nope"), false);
+});
+
+Deno.test("attrEquals() compares set-wise, scalar == single-array", () => {
+  assertEquals(attrEquals(["swamp runtime"], "swamp runtime"), true);
+  assertEquals(attrEquals(["12000"], 12000), true);
+  assertEquals(attrEquals(undefined, "x"), false);
+  assertEquals(attrEquals(["a", "b"], ["b", "a"]), true);
+});
+
+Deno.test("groupShow: snapshots a single user group into `group`", async () => {
+  const mock = installFetch({
+    group_show: ok({
+      result: { cn: ["swamp"], gidnumber: ["12000"], member_user: ["swamp"] },
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupShow.execute({ cn: "swamp" }, context);
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["group_show"]);
+    assertEquals(writes.map((w) => w.spec), ["group"]);
+    const group = writes[0].data.group as { cn: string; gidNumber: number };
+    assertEquals(group.cn, "swamp");
+    assertEquals(group.gidNumber, 12000);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupAdd: creates a group and records attempt + group state", async () => {
+  const mock = installFetch({
+    group_add: ok({ result: { cn: ["swamp"], description: ["swamp runtime"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupAdd.execute(
+      { cn: "swamp", description: "swamp runtime" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["group_add"]);
+    // The description option is passed through to group_add.
+    const params = mock.jsonCalls[0].params as [unknown[], Record<string, unknown>];
+    assertEquals(params[1].description, "swamp runtime");
+    assertEquals(writes.map((w) => w.spec), ["attempt", "group"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupAdd: idempotent swallows DuplicateEntry and re-reads via group_show", async () => {
+  const mock = installFetch({
+    group_add: err("DuplicateEntry", "group swamp already exists", 4002),
+    group_show: ok({ result: { cn: ["swamp"], gidnumber: ["12000"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupAdd.execute(
+      { cn: "swamp", idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_add",
+      "group_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "group"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupAdd: non-idempotent DuplicateEntry rejects and audits failure", async () => {
+  const mock = installFetch({
+    group_add: err("DuplicateEntry", "group swamp already exists", 4002),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await assertRejects(() =>
+      model.methods.groupAdd.execute({ cn: "swamp" }, context)
+    );
+    // Only the failure attempt is persisted (no group state on failure).
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupDel: confirm:false refuses without any network call", async () => {
+  const mock = installFetch({});
+  try {
+    const { context } = stubContext();
+    await assertRejects(
+      () => model.methods.groupDel.execute({ cn: "swamp", confirm: false }, context),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(mock.jsonCalls.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupDel: idempotent swallows NotFound as a no-op success", async () => {
+  const mock = installFetch({
+    group_del: err("NotFound", "swamp: group not found", 4001),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupDel.execute(
+      { cn: "swamp", confirm: true, idempotent: true },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), ["group_del"]);
+    assertEquals(writes.map((w) => w.spec), ["attempt"]);
+    assertEquals(writes[0].data.success, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupSync: absent group is created (group_show 404 -> group_add)", async () => {
+  const calls: string[] = [];
+  const mock = installFetch({
+    group_show: () =>
+      calls.push("show") === 1
+        ? err("NotFound", "swamp: group not found", 4001)
+        : ok({ result: { cn: ["swamp"], description: ["swamp runtime"] } }),
+    group_add: ok({ result: { cn: ["swamp"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupSync.execute(
+      { cn: "swamp", description: "swamp runtime" },
+      context,
+    );
+    // show (404) -> add -> show (final re-read).
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_show",
+      "group_add",
+      "group_show",
+    ]);
+    assertEquals(writes.map((w) => w.spec), ["attempt", "group"]);
+    const resp = writes[0].data.response as { created: boolean; changes: string[] };
+    assertEquals(resp.created, true);
+    assertEquals(resp.changes, ["created"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupSync: converged group issues no writes (mod skipped)", async () => {
+  const mock = installFetch({
+    group_show: ok({
+      result: { cn: ["swamp"], description: ["swamp runtime"] },
+    }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupSync.execute(
+      { cn: "swamp", description: "swamp runtime" },
+      context,
+    );
+    // No group_add and no group_mod — only the initial + final group_show.
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_show",
+      "group_show",
+    ]);
+    const resp = writes[0].data.response as { converged: boolean; changes: string[] };
+    assertEquals(resp.converged, true);
+    assertEquals(resp.changes, []);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("groupSync: drifted description triggers group_mod of only that key", async () => {
+  const mock = installFetch({
+    group_show: ok({
+      result: { cn: ["swamp"], description: ["old desc"] },
+    }),
+    group_mod: ok({ result: { cn: ["swamp"], description: ["new desc"] } }),
+  });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.groupSync.execute(
+      { cn: "swamp", description: "new desc" },
+      context,
+    );
+    assertEquals(mock.jsonCalls.map((c) => c.command), [
+      "group_show",
+      "group_mod",
+      "group_show",
+    ]);
+    const modParams = mock.jsonCalls[1].params as [unknown[], Record<string, unknown>];
+    assertEquals(modParams[1].description, "new desc");
+    const resp = writes[0].data.response as { changes: string[] };
+    assertEquals(resp.changes, ["mod:description"]);
   } finally {
     mock.restore();
   }

@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@shrug/freeipa/group"
-version: "2026.07.11.1"
-description: "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable."
+version: "2026.07.16.1"
+description: "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, generic user-group CRUD (groupShow/groupAdd/groupMod/groupDel) plus a desired-state groupSync reconcile, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable, with a confirm-guarded delete."
 
 repository: https://github.com/shrugpw/swamp-freeipa
 
