@@ -229,6 +229,7 @@ function stubContext() {
       user: "admin",
       password: "secret",
       apiVersion: "2.254",
+      ecProfileId: "ecUserCert",
     },
     logger: { debug: noop, info: noop, warning: noop, error: noop },
     writeResource: (
@@ -319,6 +320,71 @@ Deno.test("certRequest: generated key is persisted in cert state, never in the a
       true,
     );
     assertEquals(JSON.stringify(attempt.data).includes("PRIVATE KEY"), false);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("certRequest: algorithm=ec auto-selects ecProfileId when no explicit profileId", async () => {
+  const mock = installFetch({ cert_request: ok({ result: issuedRow }) });
+  try {
+    const { context } = stubContext();
+    await model.methods.certRequest.execute(
+      { principal: "alice", algorithm: "ec", keySize: 256, addPrincipal: false },
+      context,
+    );
+    const opts = (mock.jsonCalls[0].params as [
+      unknown[],
+      Record<string, unknown>,
+    ])[1];
+    assertEquals(opts.profile_id, "ecUserCert");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("certRequest: explicit profileId wins over the ec auto-select", async () => {
+  const mock = installFetch({ cert_request: ok({ result: issuedRow }) });
+  try {
+    const { context } = stubContext();
+    await model.methods.certRequest.execute(
+      {
+        principal: "alice",
+        algorithm: "ec",
+        keySize: 256,
+        profileId: "customEC",
+        addPrincipal: false,
+      },
+      context,
+    );
+    const opts = (mock.jsonCalls[0].params as [
+      unknown[],
+      Record<string, unknown>,
+    ])[1];
+    assertEquals(opts.profile_id, "customEC");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("certRequest: algorithm=rsa sets no profile_id (stock default)", async () => {
+  const mock = installFetch({ cert_request: ok({ result: issuedRow }) });
+  try {
+    const { context } = stubContext();
+    await model.methods.certRequest.execute(
+      {
+        principal: "alice",
+        algorithm: "rsa",
+        keySize: 2048,
+        addPrincipal: false,
+      },
+      context,
+    );
+    const opts = (mock.jsonCalls[0].params as [
+      unknown[],
+      Record<string, unknown>,
+    ])[1];
+    assertEquals(opts.profile_id, undefined);
   } finally {
     mock.restore();
   }

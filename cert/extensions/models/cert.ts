@@ -69,6 +69,12 @@ const GlobalArgsSchema = z.object({
     .describe(
       "Path to the IPA CA cert (PEM, e.g. /etc/ipa/ca.crt) to trust for this connection; omit to use system trust",
     ),
+  ecProfileId: z
+    .string()
+    .default("ecUserCert")
+    .describe(
+      "Cert profile id to auto-select for EC issuance (algorithm=ec) when no explicit profileId is given. The stock caIPAserviceCert profile rejects EC keys, so EC needs an EC-enabled profile; override per deployment. An explicit certRequest profileId always wins.",
+    ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -606,7 +612,7 @@ export async function generateCsr(opts: {
 /** FreeIPA certificate model definition. */
 export const model = {
   type: "@shrug/freeipa/cert",
-  version: "2026.07.11.1",
+  version: "2026.07.16.1",
   description:
     "Issue, inspect, and revoke X.509 certs for any FreeIPA principal (user/host/service) over the JSON-RPC API. Optional in-model RSA keygen with vaulted private keys.",
   globalArguments: GlobalArgsSchema,
@@ -764,7 +770,9 @@ export const model = {
         profileId: z
           .string()
           .optional()
-          .describe("Certificate profile id (cert_request `profile_id`)"),
+          .describe(
+            'Certificate profile id (cert_request `profile_id`). Omit and pass algorithm=ec to auto-select the ecProfileId global (default "ecUserCert"); an explicit value here always wins.',
+          ),
         caCn: z
           .string()
           .optional()
@@ -819,7 +827,13 @@ export const model = {
           add: args.addPrincipal,
           all: true,
         };
-        if (args.profileId) options.profile_id = args.profileId;
+        // Auto-select the EC cert profile when algorithm=ec and no explicit
+        // profileId: the stock caIPAserviceCert profile rejects EC keys, so EC
+        // issuance needs an EC-enabled profile (ecProfileId global, default
+        // "ecUserCert"). An explicit profileId arg always wins; RSA is untouched.
+        const effectiveProfileId = args.profileId ??
+          (args.algorithm === "ec" ? cfg.ecProfileId : undefined);
+        if (effectiveProfileId) options.profile_id = effectiveProfileId;
         if (args.caCn) options.cacn = args.caCn;
 
         const client = await ipaLogin(cfg);
@@ -829,7 +843,7 @@ export const model = {
           algorithm: args.algorithm,
           keySize: args.keySize,
           addPrincipal: args.addPrincipal,
-          profileId: args.profileId ?? null,
+          profileId: effectiveProfileId ?? null,
           caCn: args.caCn ?? null,
           subjectCn: args.subjectCn ?? null,
           csrProvided: Boolean(args.csr),
