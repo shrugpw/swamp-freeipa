@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/freeipa/cert"
-version: "2026.07.16.1"
+version: "2026.07.17.1"
 description: "Issue, inspect, and revoke X.509 certificates for any FreeIPA principal (user/host/service) over the JSON-RPC API, with optional in-model RSA/EC keygen and vaulted private keys."
 
 repository: https://github.com/shrugpw/swamp-freeipa

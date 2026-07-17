@@ -373,7 +373,13 @@ async function recordAttempt<T extends Record<string, unknown>>(
     server: context.globalArgs.server,
     attemptedAt: new Date().toISOString(),
   };
-  const instance = `attempt-${method}-${target}`;
+  // Data instance names must be filesystem-safe: swamp's data-name validator
+  // rejects '/', '\', '..', and null bytes (path-traversal guard). Host/service
+  // principals contain '/' (e.g. HTTP/web.ipa.example.com), so derive the
+  // instance name from a sanitized target while the true principal is preserved
+  // verbatim in `base.target` for the audit trail.
+  const safeTarget = target.replace(/\.\.|[/\\\0]/g, "_");
+  const instance = `attempt-${method}-${safeTarget}`;
   context.logger.info(
     "{method}: applying to {target} on {server}",
     { method, target, server: base.server, ipaCommands },
@@ -563,6 +569,7 @@ export async function generateCsr(opts: {
   subjectCn: string;
   algorithm?: KeyAlgorithm;
   keySize?: number;
+  dnsNames?: string[];
 }): Promise<GeneratedCsr> {
   x509.cryptoProvider.set(crypto);
   const algorithm: KeyAlgorithm = opts.algorithm ?? "rsa";
@@ -593,10 +600,22 @@ export async function generateCsr(opts: {
     await crypto.subtle.exportKey("spki", keys.publicKey),
   );
 
+  // SubjectAlternativeName: modern TLS clients ignore the subject CN and
+  // require a matching dNSName SAN, so server certs MUST carry one. IPA's
+  // caIPAserviceCert profile copies dNSName SANs from the CSR (validating each
+  // against the principal's host), so emit them here when requested.
+  const extensions = opts.dnsNames?.length
+    ? [
+      new x509.SubjectAlternativeNameExtension(
+        opts.dnsNames.map((value) => ({ type: "dns" as const, value })),
+      ),
+    ]
+    : undefined;
   const csr = await x509.Pkcs10CertificateRequestGenerator.create({
     name: `CN=${opts.subjectCn}`,
     keys,
     signingAlgorithm,
+    extensions,
   });
   // Round-trip to prove the encoding parses before we rely on it.
   const csrPem = csr.toString("pem");
@@ -612,7 +631,7 @@ export async function generateCsr(opts: {
 /** FreeIPA certificate model definition. */
 export const model = {
   type: "@shrug/freeipa/cert",
-  version: "2026.07.16.1",
+  version: "2026.07.17.1",
   description:
     "Issue, inspect, and revoke X.509 certs for any FreeIPA principal (user/host/service) over the JSON-RPC API. Optional in-model RSA keygen with vaulted private keys.",
   globalArguments: GlobalArgsSchema,
@@ -781,6 +800,12 @@ export const model = {
           .string()
           .optional()
           .describe("CSR subject CN when generating (defaults to `principal`)"),
+        dnsNames: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "dNSName SubjectAltName entries to embed in the generated CSR (required for usable TLS server certs — clients match SAN, not CN). Ignored when a CSR is supplied via `csr`.",
+          ),
       }),
       execute: async (
         args: {
@@ -792,6 +817,7 @@ export const model = {
           profileId?: string;
           caCn?: string;
           subjectCn?: string;
+          dnsNames?: string[];
         },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
@@ -817,6 +843,7 @@ export const model = {
             subjectCn: args.subjectCn ?? args.principal,
             algorithm: args.algorithm,
             keySize: args.keySize,
+            dnsNames: args.dnsNames,
           });
           csrPem = gen.csrPem;
           privateKeyPem = gen.privateKeyPem;

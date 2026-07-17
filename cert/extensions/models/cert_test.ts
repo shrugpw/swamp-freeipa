@@ -134,6 +134,46 @@ Deno.test("generateCsr() honors algorithm=ec (ECDSA P-256)", async () => {
   assertEquals(await csr.verify(), true);
 });
 
+/** Pull the dNSName SAN entries out of a CSR's extensionRequest attribute. */
+function csrDnsNames(csrPem: string): string[] {
+  const csr = new x509.Pkcs10CertificateRequest(csrPem);
+  const names: string[] = [];
+  for (const attr of csr.attributes) {
+    // The extensionRequest attribute (1.2.840.113549.1.9.14) carries parsed
+    // Extension objects in `.items`; find the SAN and read its dNSNames.
+    for (const ext of (attr as unknown as { items?: unknown[] }).items ?? []) {
+      if (ext instanceof x509.SubjectAlternativeNameExtension) {
+        for (const gn of ext.names.toJSON()) {
+          if (gn.type === "dns") names.push(gn.value);
+        }
+      }
+    }
+  }
+  return names;
+}
+
+Deno.test("generateCsr() embeds a dNSName SAN when dnsNames is given", async () => {
+  // Modern TLS clients match the SAN, not the CN, so a server cert is unusable
+  // without one; the CSR must carry the requested dNSNames verbatim.
+  const gen = await generateCsr({
+    subjectCn: "HTTP/web.ipa.example.com",
+    dnsNames: ["web.ipa.example.com", "web-alt.ipa.example.com"],
+  });
+  assertEquals(csrDnsNames(gen.csrPem), [
+    "web.ipa.example.com",
+    "web-alt.ipa.example.com",
+  ]);
+});
+
+Deno.test("generateCsr() emits no extensionRequest when dnsNames is omitted", async () => {
+  // The RSA/EC defaults above must stay SAN-free: an empty extensionRequest
+  // attribute would change the CSR shape for the CN-only user-cert path.
+  const gen = await generateCsr({ subjectCn: "alice" });
+  const csr = new x509.Pkcs10CertificateRequest(gen.csrPem);
+  assertEquals(csr.attributes.length, 0);
+  assertEquals(csrDnsNames(gen.csrPem), []);
+});
+
 // ---------------------------------------------------------------------------
 // Mocked-transport harness — drives the method execute paths without a network.
 // ---------------------------------------------------------------------------
@@ -325,12 +365,47 @@ Deno.test("certRequest: generated key is persisted in cert state, never in the a
   }
 });
 
+Deno.test("certRequest: service principal with '/' yields a filesystem-safe audit name", async () => {
+  // swamp's data-name validator rejects '/', '\\', '..', and NUL (path-traversal
+  // guard). Host/service principals contain '/' (e.g. HTTP/web.ipa.example.com),
+  // so the audit *instance name* must be sanitized while the true principal is
+  // preserved verbatim in the audit `target` field.
+  const mock = installFetch({ cert_request: ok({ result: issuedRow }) });
+  try {
+    const { context, writes } = stubContext();
+    await model.methods.certRequest.execute(
+      {
+        principal: "HTTP/web.ipa.example.com",
+        algorithm: "rsa",
+        keySize: 2048,
+        addPrincipal: false,
+        dnsNames: ["web.ipa.example.com"],
+      },
+      context,
+    );
+    const attempt = writes[0];
+    assertEquals(attempt.spec, "attempt");
+    // Instance name has no path separators; the '/' became '_'.
+    assertEquals(attempt.name, "attempt-cert_request-HTTP_web.ipa.example.com");
+    assertEquals(/[/\\\0]|\.\./.test(attempt.name), false);
+    // The real principal survives untouched in the audit trail.
+    assertEquals(attempt.data.target, "HTTP/web.ipa.example.com");
+  } finally {
+    mock.restore();
+  }
+});
+
 Deno.test("certRequest: algorithm=ec auto-selects ecProfileId when no explicit profileId", async () => {
   const mock = installFetch({ cert_request: ok({ result: issuedRow }) });
   try {
     const { context } = stubContext();
     await model.methods.certRequest.execute(
-      { principal: "alice", algorithm: "ec", keySize: 256, addPrincipal: false },
+      {
+        principal: "alice",
+        algorithm: "ec",
+        keySize: 256,
+        addPrincipal: false,
+      },
       context,
     );
     const opts = (mock.jsonCalls[0].params as [
