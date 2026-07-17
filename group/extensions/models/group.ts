@@ -601,7 +601,7 @@ interface CheckContext {
 /** FreeIPA group management model definition. */
 export const model = {
   type: "@shrug/freeipa/group",
-  version: "2026.07.16.1",
+  version: "2026.07.17.1",
   description:
     "Manage FreeIPA user & host groups over the JSON-RPC API: snapshot the inventory, generic user-group CRUD (groupShow/groupAdd/groupMod/groupDel) plus a desired-state groupSync reconcile, ensure the FreeRADIUS radius-vlan-<id> group pair, and add/remove members — idempotent and auditable, with a confirm-guarded delete.",
   globalArguments: GlobalArgsSchema,
@@ -636,7 +636,7 @@ export const model = {
   checks: {
     "group-exists": {
       description:
-        "Verify the most recently snapshotted user group still exists before a destructive delete.",
+        "Best-effort pre-flight: swamp checks cannot see the method args, so this re-checks the LAST group this model snapshotted (not necessarily the groupDel target) still exists on the server, catching a stale-target delete against a live server. The confirm:true guard and IPA's own NotFound error remain the per-cn safeguards.",
       labels: ["live"],
       appliesTo: ["groupDel"],
       execute: async (
